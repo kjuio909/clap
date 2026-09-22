@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Fixes
+
+- *(fish) Generate completions for subcommands nested more than two levels deep
+- *(fish) Match the full, ordered subcommand chain in `complete` conditions so same-named subcommands on different branches don't share completions
+
 ## [4.6.10] - 2026-09-14
 
 ## [4.6.9] - 2026-08-06

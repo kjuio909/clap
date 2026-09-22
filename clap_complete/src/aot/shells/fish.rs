@@ -98,29 +98,23 @@ fn gen_fish_inner(
             basic_template.push_str(&format!(" -n \"{needs_fn_name}\""));
         }
     } else {
+        // The condition must check the full, ordered chain of parent commands so
+        // that identically named subcommands on different branches (e.g.
+        // `demo alpha beta` vs `demo omega beta`) don't share completions.
         let mut out = String::from(using_fn_name);
-        match parent_commands {
-            [] => unreachable!(),
-            [command] => {
+        for command in parent_commands {
+            out.push_str(&format!(" {command}"));
+        }
+        let subcommands: Vec<_> = cmd
+            .get_subcommands()
+            .flat_map(Command::get_name_and_visible_aliases)
+            .collect();
+        for name in subcommands {
+            out.push_str(&format!("; and not {using_fn_name}"));
+            for command in parent_commands {
                 out.push_str(&format!(" {command}"));
-                if cmd.has_subcommands() {
-                    out.push_str("; and not __fish_seen_subcommand_from");
-                }
-                let subcommands = cmd
-                    .get_subcommands()
-                    .flat_map(Command::get_name_and_visible_aliases);
-                for name in subcommands {
-                    out.push_str(&format!(" {name}"));
-                }
             }
-            [command, subcommand] => out.push_str(&format!(
-                " {command}; and __fish_seen_subcommand_from {subcommand}"
-            )),
-            // HACK: Assuming subcommands are only nested less than 3 levels as more than that is
-            // unwieldy and takes more effort to support.
-            // For example, `rustup toolchain help install` is the longest valid command line of `rustup`
-            // that uses nested subcommands, and it cannot receive any flags to it.
-            _ => return,
+            out.push_str(&format!(" {name}"));
         }
         basic_template.push_str(format!(" -n \"{out}\"").as_str());
     }
@@ -267,10 +261,19 @@ function {needs_fn_name}
 end
 
 function {using_fn_name}
-    set -l cmd ({needs_fn_name})
-    test -z \"$cmd\"
-    and return 1
-    contains -- $cmd[1] $argv
+    # Check that the subcommands on the command line contain the expected
+    # chain of subcommands, in order.
+    set -l expected $argv
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    argparse -s ({optspecs_fn_name}) -- $cmd 2>/dev/null
+    or return
+    for token in $argv
+        if set -q expected[1]; and test \"$token\" = \"$expected[1]\"
+            set -e expected[1]
+        end
+    end
+    not set -q expected[1]
 end
 
 "

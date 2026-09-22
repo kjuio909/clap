@@ -18,10 +18,19 @@ function __fish_bin_name_needs_command
 end
 
 function __fish_bin_name_using_subcommand
-    set -l cmd (__fish_bin_name_needs_command)
-    test -z "$cmd"
-    and return 1
-    contains -- $cmd[1] $argv
+    # Check that the subcommands on the command line contain the expected
+    # chain of subcommands, in order.
+    set -l expected $argv
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    argparse -s (__fish_bin_name_global_optspecs) -- $cmd 2>/dev/null
+    or return
+    for token in $argv
+        if set -q expected[1]; and test "$token" = "$expected[1]"
+            set -e expected[1]
+        end
+    end
+    not set -q expected[1]
 end
 
 complete -c bin-name -n "__fish_bin_name_needs_command" -s c
@@ -32,5 +41,5 @@ complete -c bin-name -n "__fish_bin_name_needs_command" -f -a "help" -d 'Print t
 complete -c bin-name -n "__fish_bin_name_using_subcommand test" -s d
 complete -c bin-name -n "__fish_bin_name_using_subcommand test" -s c
 complete -c bin-name -n "__fish_bin_name_using_subcommand test" -s h -l help -d 'Print help'
-complete -c bin-name -n "__fish_bin_name_using_subcommand help; and not __fish_seen_subcommand_from test help" -f -a "test" -d 'Subcommand with a second line'
-complete -c bin-name -n "__fish_bin_name_using_subcommand help; and not __fish_seen_subcommand_from test help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c bin-name -n "__fish_bin_name_using_subcommand help; and not __fish_bin_name_using_subcommand help test; and not __fish_bin_name_using_subcommand help help" -f -a "test" -d 'Subcommand with a second line'
+complete -c bin-name -n "__fish_bin_name_using_subcommand help; and not __fish_bin_name_using_subcommand help test; and not __fish_bin_name_using_subcommand help help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
