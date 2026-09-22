@@ -24,6 +24,98 @@ function __fish_exhaustive_using_subcommand
     contains -- $cmd[1] $argv
 end
 
+function __fish_exhaustive_using_command_global_one_one_one
+    # Match the full ordered subcommand chain leading here, ignoring options.
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    set -q cmd[1]
+    or return 1
+    contains -- $cmd[-1] -- --generate --empty-choice
+    and set -a cmd __fish_clap_complete_value
+    argparse -i empty-choice= generate= global h/help V/version -- $cmd 2>/dev/null
+    or return 1
+    test (count $argv) -ge 3
+    or return 1
+    test "$argv[1]" = 'global'
+    or return 1
+    test "$argv[2]" = 'one'
+    or return 1
+    test "$argv[3]" = 'one-one'
+    or return 1
+    return 0
+end
+
+function __fish_exhaustive_using_command_global_one_help
+    # Match the full ordered subcommand chain leading here, ignoring options.
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    set -q cmd[1]
+    or return 1
+    contains -- $cmd[-1] -- --generate --empty-choice
+    and set -a cmd __fish_clap_complete_value
+    argparse -i empty-choice= generate= global h/help V/version -- $cmd 2>/dev/null
+    or return 1
+    test (count $argv) -ge 3
+    or return 1
+    test "$argv[1]" = 'global'
+    or return 1
+    test "$argv[2]" = 'one'
+    or return 1
+    test "$argv[3]" = 'help'
+    or return 1
+    contains -- one-one $argv[4..]
+    and return 1
+    contains -- help $argv[4..]
+    and return 1
+    return 0
+end
+
+function __fish_exhaustive_using_command_global_help_one
+    # Match the full ordered subcommand chain leading here, ignoring options.
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    set -q cmd[1]
+    or return 1
+    contains -- $cmd[-1] -- --generate --empty-choice
+    and set -a cmd __fish_clap_complete_value
+    argparse -i empty-choice= generate= global h/help V/version -- $cmd 2>/dev/null
+    or return 1
+    test (count $argv) -ge 3
+    or return 1
+    test "$argv[1]" = 'global'
+    or return 1
+    test "$argv[2]" = 'help'
+    or return 1
+    test "$argv[3]" = 'one'
+    or return 1
+    contains -- one-one $argv[4..]
+    and return 1
+    return 0
+end
+
+function __fish_exhaustive_using_command_help_global_one
+    # Match the full ordered subcommand chain leading here, ignoring options.
+    set -l cmd (commandline -opc)
+    set -e cmd[1]
+    set -q cmd[1]
+    or return 1
+    contains -- $cmd[-1] -- --generate --empty-choice
+    and set -a cmd __fish_clap_complete_value
+    argparse -i empty-choice= generate= h/help -- $cmd 2>/dev/null
+    or return 1
+    test (count $argv) -ge 3
+    or return 1
+    test "$argv[1]" = 'help'
+    or return 1
+    test "$argv[2]" = 'global'
+    or return 1
+    test "$argv[3]" = 'one'
+    or return 1
+    contains -- one-one $argv[4..]
+    and return 1
+    return 0
+end
+
 complete -c exhaustive -n "__fish_exhaustive_needs_command" -l generate -d 'generate' -r -f -a "bash\t''
 elvish\t''
 fish\t''
@@ -52,12 +144,18 @@ complete -c exhaustive -n "__fish_exhaustive_using_subcommand global; and __fish
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand global; and __fish_seen_subcommand_from one" -s V -l version -d 'Print version'
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand global; and __fish_seen_subcommand_from one" -f -a "one-one"
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand global; and __fish_seen_subcommand_from one" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c exhaustive -n "__fish_exhaustive_using_command_global_one_one_one" -l global -d 'everywhere'
+complete -c exhaustive -n "__fish_exhaustive_using_command_global_one_one_one" -s h -l help -d 'Print help'
+complete -c exhaustive -n "__fish_exhaustive_using_command_global_one_one_one" -s V -l version -d 'Print version'
+complete -c exhaustive -n "__fish_exhaustive_using_command_global_one_help" -f -a "one-one"
+complete -c exhaustive -n "__fish_exhaustive_using_command_global_one_help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand global; and __fish_seen_subcommand_from two" -l global -d 'everywhere'
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand global; and __fish_seen_subcommand_from two" -s h -l help -d 'Print help'
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand global; and __fish_seen_subcommand_from two" -s V -l version -d 'Print version'
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand global; and __fish_seen_subcommand_from help" -f -a "one"
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand global; and __fish_seen_subcommand_from help" -f -a "two"
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand global; and __fish_seen_subcommand_from help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
+complete -c exhaustive -n "__fish_exhaustive_using_command_global_help_one" -f -a "one-one"
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand action" -l set -d 'value' -r
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand action" -l choice -d 'enum' -r -f -a "first\t''
 second\t''"
@@ -143,6 +241,7 @@ complete -c exhaustive -n "__fish_exhaustive_using_subcommand help; and not __fi
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand help; and not __fish_seen_subcommand_from empty global action quote value pacman last alias hint help" -f -a "help" -d 'Print this message or the help of the given subcommand(s)'
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand help; and __fish_seen_subcommand_from global" -f -a "one"
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand help; and __fish_seen_subcommand_from global" -f -a "two"
+complete -c exhaustive -n "__fish_exhaustive_using_command_help_global_one" -f -a "one-one"
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand help; and __fish_seen_subcommand_from quote" -f -a "cmd-single-quotes" -d 'Can be \'always\', \'auto\', or \'never\''
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand help; and __fish_seen_subcommand_from quote" -f -a "cmd-double-quotes" -d 'Can be "always", "auto", or "never"'
 complete -c exhaustive -n "__fish_exhaustive_using_subcommand help; and __fish_seen_subcommand_from quote" -f -a "cmd-backticks" -d 'For more information see `echo test`'

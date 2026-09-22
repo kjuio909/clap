@@ -320,6 +320,41 @@ pub(crate) fn subcommand_last(name: &'static str) -> clap::Command {
         .subcommands([clap::Command::new("foo"), clap::Command::new("bar")])
 }
 
+/// Two subcommand branches that deliberately reuse the same `beta`/`gamma` names, exercising
+/// arbitrary-depth nested subcommands and making sure the two chains never share completions.
+pub(crate) fn deep_subcommands_command(name: &'static str) -> clap::Command {
+    clap::Command::new(name).subcommand(
+        clap::Command::new("alpha").subcommand(
+            clap::Command::new("beta").subcommand(
+                clap::Command::new("gamma")
+                    .arg(
+                        clap::Arg::new("mode")
+                            .long("mode")
+                            .action(clap::ArgAction::Set)
+                            .value_parser(["fast", "safe"]),
+                    )
+                    .subcommand(
+                        clap::Command::new("delta").arg(
+                            clap::Arg::new("leaf")
+                                .long("leaf")
+                                .action(clap::ArgAction::SetTrue),
+                        ),
+                    ),
+            ),
+        ),
+    ).subcommand(
+        clap::Command::new("omega").subcommand(
+            clap::Command::new("beta").subcommand(
+                clap::Command::new("gamma").arg(
+                    clap::Arg::new("other")
+                        .long("other")
+                        .action(clap::ArgAction::SetTrue),
+                ),
+            ),
+        ),
+    )
+}
+
 pub(crate) fn assert_matches(
     expected: impl IntoData,
     generator: impl clap_complete::Generator,
