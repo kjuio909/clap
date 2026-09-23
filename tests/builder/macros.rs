@@ -158,9 +158,19 @@ None
 }
 
 #[test]
-#[should_panic = "Multiple values not yet supported"]
 fn arg_long_multiple_values() {
-    arg!(--long <VALUE1> <VALUE2> <VALUE3> [VALUE4] [VALUE5]);
+    let arg = arg!(--long <VALUE1> <VALUE2> <VALUE3> [VALUE4] [VALUE5]);
+    assert_eq!(arg.get_id(), "long");
+    assert_eq!(
+        arg.get_value_names()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>(),
+        vec!["VALUE1", "VALUE2", "VALUE3", "VALUE4", "VALUE5"]
+    );
+    assert_eq!(arg.get_num_args(), Some((3..=5).into()));
+    assert!(!arg.is_required_set());
 }
 
 #[test]
@@ -238,9 +248,25 @@ None
 }
 
 #[test]
-#[should_panic = "Multiple values not yet supported"]
 fn arg_multiple_values() {
-    arg!(<VALUE1> <VALUE2> <VALUE3> [VALUE4] [VALUE5]);
+    let arg = arg!(<VALUE1> <VALUE2> <VALUE3> [VALUE4] [VALUE5]);
+    assert_eq!(arg.get_id(), "VALUE1");
+    assert_eq!(
+        arg.get_value_names()
+            .unwrap()
+            .iter()
+            .map(|s| s.as_str())
+            .collect::<Vec<_>>(),
+        vec!["VALUE1", "VALUE2", "VALUE3", "VALUE4", "VALUE5"]
+    );
+    assert_eq!(arg.get_num_args(), Some((3..=5).into()));
+    assert!(arg.is_required_set());
+}
+
+#[test]
+#[should_panic = "Required value placeholders must precede optional value placeholders"]
+fn arg_multiple_values_bad_order() {
+    let _ = arg!(<VALUE1> [VALUE2] <VALUE3>);
 }
 
 #[test]

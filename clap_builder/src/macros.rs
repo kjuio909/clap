@@ -284,7 +284,6 @@ macro_rules! arg_impl {
         $($tail:tt)*
     ) => {{
         debug_assert!(!matches!($arg.get_action(), $crate::ArgAction::Append), "Flags should precede `...`");
-        debug_assert_eq!($arg.get_value_names(), None, "Multiple values not yet supported");
 
         let mut arg = $arg;
 
@@ -299,10 +298,9 @@ macro_rules! arg_impl {
         let arg = arg
             .value_name(value_name)
             .action($crate::ArgAction::Set);
-        let arg = $crate::arg_impl! {
-            @arg (arg) $($tail)*
-        };
-        arg
+        $crate::arg_impl! {
+            @next (arg) (1, 1, 0) [$crate::arg_impl!(@string $value_name),] $($tail)*
+        }
     }};
     (
         @arg
@@ -311,7 +309,6 @@ macro_rules! arg_impl {
         $($tail:tt)*
     ) => {{
         debug_assert!(!matches!($arg.get_action(), $crate::ArgAction::Append), "Flags should precede `...`");
-        debug_assert_eq!($arg.get_value_names(), None, "Multiple values not yet supported");
 
         let mut arg = $arg;
 
@@ -326,10 +323,9 @@ macro_rules! arg_impl {
         let arg = arg
             .value_name(value_name)
             .action($crate::ArgAction::Set);
-        let arg = $crate::arg_impl! {
-            @arg (arg) $($tail)*
-        };
-        arg
+        $crate::arg_impl! {
+            @next (arg) (1, 1, 0) [$crate::arg_impl!(@string $value_name),] $($tail)*
+        }
     }};
     (
         @arg
@@ -338,7 +334,6 @@ macro_rules! arg_impl {
         $($tail:tt)*
     ) => {{
         debug_assert!(!matches!($arg.get_action(), $crate::ArgAction::Append), "Flags should precede `...`");
-        debug_assert_eq!($arg.get_value_names(), None, "Multiple values not yet supported");
 
         let mut arg = $arg;
 
@@ -355,10 +350,9 @@ macro_rules! arg_impl {
         let arg = arg
             .value_name(value_name)
             .action($crate::ArgAction::Set);
-        let arg = $crate::arg_impl! {
-            @arg (arg) $($tail)*
-        };
-        arg
+        $crate::arg_impl! {
+            @next (arg) (0, 1, 1) [$crate::arg_impl!(@string $value_name),] $($tail)*
+        }
     }};
     (
         @arg
@@ -367,7 +361,6 @@ macro_rules! arg_impl {
         $($tail:tt)*
     ) => {{
         debug_assert!(!matches!($arg.get_action(), $crate::ArgAction::Append), "Flags should precede `...`");
-        debug_assert_eq!($arg.get_value_names(), None, "Multiple values not yet supported");
 
         let mut arg = $arg;
 
@@ -384,10 +377,149 @@ macro_rules! arg_impl {
         let arg = arg
             .value_name(value_name)
             .action($crate::ArgAction::Set);
-        let arg = $crate::arg_impl! {
-            @arg (arg) $($tail)*
+        $crate::arg_impl! {
+            @next (arg) (0, 1, 1) [$crate::arg_impl!(@string $value_name),] $($tail)*
+        }
+    }};
+    // Continuation of a value-placeholder sequence.
+    // State is `($min, $max, $optional)` plus `[$names:expr, ...]`, the placeholder names
+    // collected so far.  `$optional` records whether an optional (`[NAME]`) was seen.
+    (
+        @next
+        ($arg:expr)
+        ($min:expr, $max:expr, $optional:expr)
+        [$($names:expr),* $(,)?]
+        <$value_name:ident>
+        $($tail:tt)*
+    ) => {{
+        debug_assert_eq!(
+            $optional, 0,
+            "Required value placeholders must precede optional value placeholders"
+        );
+
+        $crate::arg_impl! {
+            @next ($arg) ($min + 1, $max + 1, $optional)
+            [$($names,)* $crate::arg_impl!(@string $value_name)]
+            $($tail)*
+        }
+    }};
+    (
+        @next
+        ($arg:expr)
+        ($min:expr, $max:expr, $optional:expr)
+        [$($names:expr),* $(,)?]
+        <$value_name:literal>
+        $($tail:tt)*
+    ) => {{
+        debug_assert_eq!(
+            $optional, 0,
+            "Required value placeholders must precede optional value placeholders"
+        );
+
+        $crate::arg_impl! {
+            @next ($arg) ($min + 1, $max + 1, $optional)
+            [$($names,)* $crate::arg_impl!(@string $value_name)]
+            $($tail)*
+        }
+    }};
+    (
+        @next
+        ($arg:expr)
+        ($min:expr, $max:expr, $optional:expr)
+        [$($names:expr),* $(,)?]
+        [$value_name:ident]
+        $($tail:tt)*
+    ) => {{
+        $crate::arg_impl! {
+            @next ($arg) ($min, $max + 1, 1)
+            [$($names,)* $crate::arg_impl!(@string $value_name)]
+            $($tail)*
+        }
+    }};
+    (
+        @next
+        ($arg:expr)
+        ($min:expr, $max:expr, $optional:expr)
+        [$($names:expr),* $(,)?]
+        [$value_name:literal]
+        $($tail:tt)*
+    ) => {{
+        $crate::arg_impl! {
+            @next ($arg) ($min, $max + 1, 1)
+            [$($names,)* $crate::arg_impl!(@string $value_name)]
+            $($tail)*
+        }
+    }};
+    // Placeholders followed by `...`.  A single placeholder keeps its historical meaning
+    // (repeated occurrences); multiple placeholders keep accepting values past the fixed ones.
+    (
+        @next
+        ($arg:expr)
+        ($min:expr, $max:expr, $optional:expr)
+        [$($names:expr),* $(,)?]
+        ...
+        $($tail:tt)*
+    ) => {{
+        let _ = $optional;
+        if $max > 1 {
+            let arg = $arg
+                .value_names([$($names),*])
+                .num_args($min..)
+                // Allow collecting arguments interleaved with flags
+                .action($crate::ArgAction::Append);
+            $crate::arg_impl! {
+                @arg (arg) $($tail)*
+            }
+        } else {
+            $crate::arg_impl! {
+                @arg ($arg) ... $($tail)*
+            }
+        }
+    }};
+    // Placeholders followed by a help string (or nothing): finalize the placeholder names
+    // and `num_args`.  A lone placeholder keeps the settings chosen by its first arm
+    // (unset value count for a required value, `0..=1` for an optional named value).
+    (
+        @next
+        ($arg:expr)
+        ($min:expr, $max:expr, $optional:expr)
+        [$($names:expr),* $(,)?]
+        $help:literal
+    ) => {{
+        let _ = $optional;
+        let arg = if $max > 1 {
+            $arg.value_names([$($names),*]).num_args($min..=$max)
+        } else {
+            $arg
         };
-        arg
+        arg.help($help)
+    }};
+    (
+        @next
+        ($arg:expr)
+        ($min:expr, $max:expr, $optional:expr)
+        [$($names:expr),* $(,)?]
+    ) => {{
+        let _ = $optional;
+        if $max > 1 {
+            $arg.value_names([$($names),*]).num_args($min..=$max)
+        } else {
+            $arg
+        }
+    }};
+    // Anything else after a value placeholder is unsupported (e.g. a flag out of order).
+    (
+        @next
+        ($arg:expr)
+        ($min:expr, $max:expr, $optional:expr)
+        [$($names:expr),* $(,)?]
+        $($tail:tt)+
+    ) => {{
+        let _ = ($min, $max, $optional, $($names),*);
+        compile_error!(
+            "Expected value placeholders (`<NAME>`/`[NAME]`), `...`, or a help string; \
+             flags must precede value placeholders"
+        )
     }};
     (
         @arg
@@ -494,7 +626,14 @@ macro_rules! arg_impl {
 ///   - Named argument: optional value
 /// - `<>` like `<FOO>`: required
 ///
-/// See [`Arg::value_name`][crate::Arg::value_name].
+/// Multiple placeholders may follow one another to declare several values per occurrence,
+/// e.g. `--copy <SRC> <DST> [MODE]`.  The placeholder order is preserved in
+/// [`Arg::get_value_names`][crate::Arg::get_value_names] and the accepted value count is derived
+/// from them (here, two required and one optional value, i.e. `2..=3`).  Required placeholders
+/// (`<FOO>`) must precede optional ones (`[FOO]`).
+///
+/// See [`Arg::value_name`][crate::Arg::value_name] and
+/// [`Arg::value_names`][crate::Arg::value_names].
 ///
 /// ### `...`
 ///
@@ -524,6 +663,33 @@ macro_rules! arg_impl {
 /// assert_eq!(m.get_one::<String>("config").unwrap(), "file.toml");
 /// assert_eq!(*m.get_one::<u8>("debug").unwrap(), 0);
 /// assert_eq!(m.get_one::<String>("input"), None);
+/// ```
+///
+/// An argument can take several values per occurrence by listing several placeholders:
+///
+/// ```rust
+/// # use clap_builder as clap;
+/// # use clap::{Command, arg};
+/// let cmd = Command::new("prog").arg(arg!(--copy <SRC> <DST> [MODE]));
+///
+/// // Two values (the optional `MODE` is omitted)
+/// let m = cmd
+///     .clone()
+///     .try_get_matches_from(["prog", "--copy", "a", "b"])
+///     .unwrap();
+/// assert_eq!(
+///     m.get_many::<String>("copy").unwrap().collect::<Vec<_>>(),
+///     vec!["a", "b"]
+/// );
+///
+/// // All three values, in declaration order
+/// let m = cmd
+///     .try_get_matches_from(["prog", "--copy", "a", "b", "fast"])
+///     .unwrap();
+/// assert_eq!(
+///     m.get_many::<String>("copy").unwrap().collect::<Vec<_>>(),
+///     vec!["a", "b", "fast"]
+/// );
 /// ```
 /// [`Arg`]: crate::Arg
 #[macro_export]

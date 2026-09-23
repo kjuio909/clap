@@ -314,6 +314,153 @@ Options:
 "#]]
         );
     }
+
+    #[test]
+    fn multiple_named_value_names() {
+        let arg = clap::arg!(--copy <SRC> <DST> [MODE]);
+        assert_eq!(arg.get_id(), "copy");
+        assert_eq!(arg.get_long(), Some("copy"));
+        assert_eq!(
+            arg.get_value_names(),
+            Some(vec!["SRC".into(), "DST".into(), "MODE".into()].as_slice())
+        );
+        assert_eq!(arg.get_num_args(), Some((2..=3).into()));
+        assert!(matches!(arg.get_action(), clap::ArgAction::Set));
+        assert!(!arg.is_required_set());
+    }
+
+    #[test]
+    fn multiple_named_values_parse() {
+        let mut cmd = clap::Command::new("tool").arg(clap::arg!(--copy <SRC> <DST> [MODE]));
+
+        let m = cmd
+            .try_get_matches_from_mut(["tool", "--copy", "a", "b"])
+            .unwrap();
+        assert_eq!(
+            m.get_many::<String>("copy").unwrap().collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        let m = cmd
+            .try_get_matches_from_mut(["tool", "--copy", "a", "b", "fast"])
+            .unwrap();
+        assert_eq!(
+            m.get_many::<String>("copy").unwrap().collect::<Vec<_>>(),
+            vec!["a", "b", "fast"]
+        );
+
+        let err = cmd
+            .try_get_matches_from_mut(["tool", "--copy", "a"])
+            .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::TooFewValues);
+    }
+
+    #[test]
+    #[cfg(all(feature = "help", feature = "usage"))]
+    fn multiple_named_values_help() {
+        let mut cmd = clap::Command::new("tool").arg(clap::arg!(--copy <SRC> <DST> [MODE]));
+        let help = cmd.render_help().to_string();
+        assert!(
+            help.contains("--copy <SRC> <DST> [MODE]"),
+            "unexpected help:\n{help}"
+        );
+    }
+
+    #[test]
+    fn multiple_positional_value_names() {
+        let arg = clap::arg!(files: <IN> [OUT]);
+        assert_eq!(arg.get_id(), "files");
+        assert_eq!(
+            arg.get_value_names(),
+            Some(vec!["IN".into(), "OUT".into()].as_slice())
+        );
+        assert_eq!(arg.get_num_args(), Some((1..=2).into()));
+        assert!(matches!(arg.get_action(), clap::ArgAction::Set));
+        assert!(arg.is_required_set());
+
+        // Without an explicit id, the first placeholder name is used.
+        let arg = clap::arg!(<IN> [OUT]);
+        assert_eq!(arg.get_id(), "IN");
+        assert_eq!(arg.get_num_args(), Some((1..=2).into()));
+        assert!(arg.is_required_set());
+    }
+
+    #[test]
+    fn multiple_positional_values_parse() {
+        let mut cmd = clap::Command::new("tool").arg(clap::arg!(files: <IN> [OUT]));
+
+        let m = cmd.try_get_matches_from_mut(["tool", "a"]).unwrap();
+        assert_eq!(
+            m.get_many::<String>("files").unwrap().collect::<Vec<_>>(),
+            vec!["a"]
+        );
+
+        let m = cmd.try_get_matches_from_mut(["tool", "a", "b"]).unwrap();
+        assert_eq!(
+            m.get_many::<String>("files").unwrap().collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        let err = cmd.try_get_matches_from_mut(["tool"]).unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
+    #[cfg(all(feature = "help", feature = "usage"))]
+    fn multiple_positional_values_help() {
+        let mut cmd = clap::Command::new("tool").arg(clap::arg!(files: <IN> [OUT]));
+        let help = cmd.render_help().to_string();
+        assert!(help.contains("<IN> [OUT]"), "unexpected help:\n{help}");
+    }
+
+    #[test]
+    fn multiple_value_names_string_literals() {
+        let arg = clap::arg!(--copy <"src"> <"dst"> ["mode"]);
+        assert_eq!(
+            arg.get_value_names(),
+            Some(vec!["src".into(), "dst".into(), "mode".into()].as_slice())
+        );
+        assert_eq!(arg.get_num_args(), Some((2..=3).into()));
+    }
+
+    #[test]
+    #[should_panic = "Required value placeholders must precede optional value placeholders"]
+    fn multiple_value_names_bad_order() {
+        let _ = clap::arg!(files: [OUT] <IN>);
+    }
+
+    #[test]
+    fn multiple_values_with_short_long_and_help() {
+        let arg = clap::arg!(foo: -c --copy <SRC> <DST> "copy things");
+        assert_eq!(arg.get_id(), "foo");
+        assert_eq!(arg.get_short(), Some('c'));
+        assert_eq!(arg.get_long(), Some("copy"));
+        assert_eq!(
+            arg.get_value_names(),
+            Some(vec!["SRC".into(), "DST".into()].as_slice())
+        );
+        assert_eq!(arg.get_num_args(), Some((2..=2).into()));
+        assert_eq!(
+            arg.get_help().map(|s| s.to_string()),
+            Some("copy things".to_owned())
+        );
+    }
+
+    #[test]
+    fn multiple_values_with_dots() {
+        let arg = clap::arg!(--copy <SRC> <DST> ...);
+        assert_eq!(arg.get_num_args(), Some((2..).into()));
+        assert!(matches!(arg.get_action(), clap::ArgAction::Append));
+
+        let mut cmd = clap::Command::new("tool").arg(arg);
+        let m = cmd
+            .try_get_matches_from_mut(["tool", "--copy", "a", "b", "c", "d"])
+            .unwrap();
+        assert_eq!(
+            m.get_many::<String>("copy").unwrap().collect::<Vec<_>>(),
+            vec!["a", "b", "c", "d"]
+        );
+    }
 }
 
 mod arg_impl {
