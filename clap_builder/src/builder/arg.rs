@@ -4180,6 +4180,12 @@ impl Arg {
         &self.id
     }
 
+    /// Get the arguments and groups that conflict with this argument
+    #[inline]
+    pub fn get_conflicts_with(&self) -> impl Iterator<Item = &Id> + Clone {
+        self.conflicts.iter()
+    }
+
     /// Get the help specified for this argument, if any
     #[inline]
     pub fn get_help(&self) -> Option<&StyledStr> {

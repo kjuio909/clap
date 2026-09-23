@@ -1531,6 +1531,318 @@ pos-c
     );
 }
 
+#[test]
+fn suggest_conflicting_args() {
+    fn command() -> Command {
+        Command::new("exhaustive")
+            .arg(
+                clap::Arg::new("safe")
+                    .long("safe")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                clap::Arg::new("fast")
+                    .long("fast")
+                    .visible_alias("quick")
+                    .alias("speedy")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("safe"),
+            )
+            .arg(
+                clap::Arg::new("tag")
+                    .long("tag")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                clap::Arg::new("file")
+                    .long("file")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .group(
+                clap::ArgGroup::new("payload")
+                    .args(["tag", "file"])
+                    .conflicts_with("fast"),
+            )
+    }
+
+    assert_data_eq!(
+        complete!(command(), "--fast [TAB]"),
+        snapbox::str![[r#"
+--fast
+--help	Print help
+"#]],
+    );
+
+    assert_data_eq!(
+        complete!(command(), "--tag [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // Conflicts are bidirectional: `--safe` hides `--fast` and its aliases,
+    // while the unrelated `payload` group stays available.
+    assert_data_eq!(
+        complete!(command(), "--safe [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--file
+--help	Print help
+"#]],
+    );
+
+    // A non-`multiple` group makes its members conflict with each other.
+    assert_data_eq!(
+        complete!(command(), "--file [TAB]"),
+        snapbox::str![[r#"
+--safe
+--file
+--help	Print help
+"#]],
+    );
+
+    // Prefix-completion keeps the present argument itself, including its
+    // aliases; only disabled arguments lose theirs.
+    assert_data_eq!(
+        complete!(command(), "--fast --q[TAB]"),
+        snapbox::str!["--quick"]
+    );
+    assert_data_eq!(
+        complete!(command(), "--fast --spe[TAB]"),
+        snapbox::str!["--speedy"]
+    );
+    assert_data_eq!(
+        complete!(command(), "--fast --ta[TAB]"),
+        snapbox::str![]
+    );
+
+    // A value given to an option is not mistaken for an option name.
+    assert_data_eq!(
+        complete!(command(), "--tag --safe [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
+fn suggest_conflicts_declared_on_absent_arg() {
+    // The conflict is declared by `safe`, yet completing after `--fast` must
+    // still hide `--safe`: conflicts are evaluated bidirectionally.
+    let mut cmd = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("safe")
+                .long("safe")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("fast"),
+        );
+
+    assert_data_eq!(
+        complete!(cmd, "--fast [TAB]"),
+        snapbox::str![[r#"
+--fast
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
+fn suggest_conflicts_with_all_and_groups() {
+    let mut cmd = Command::new("exhaustive")
+        .arg(clap::Arg::new("a").long("a").action(clap::ArgAction::SetTrue))
+        .arg(clap::Arg::new("b").long("b").action(clap::ArgAction::SetTrue))
+        .arg(clap::Arg::new("c").long("c").action(clap::ArgAction::SetTrue))
+        .arg(
+            clap::Arg::new("all")
+                .long("all")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with_all(["a", "b", "c"]),
+        );
+
+    assert_data_eq!(
+        complete!(cmd, "--all [TAB]"),
+        snapbox::str![[r#"
+--all
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
+fn suggest_conflicts_unroll_group() {
+    fn command() -> Command {
+        Command::new("exhaustive")
+            .arg(clap::Arg::new("a").long("a").action(clap::ArgAction::SetTrue))
+            .arg(clap::Arg::new("b").long("b").action(clap::ArgAction::SetTrue))
+            .arg(
+                clap::Arg::new("other")
+                    .long("other")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .group(
+                clap::ArgGroup::new("ab")
+                    .args(["a", "b"])
+                    .conflicts_with("other"),
+            )
+    }
+
+    // A conflict with a group is expanded to every member: `--other` hides
+    // `--a` and `--b`, in both directions.
+    assert_data_eq!(
+        complete!(command(), "--other [TAB]"),
+        snapbox::str![[r#"
+--other
+--help	Print help
+"#]],
+    );
+
+    // `--a` hides `--other` through the group and hides `--b` because the
+    // group is not `multiple`.
+    assert_data_eq!(
+        complete!(command(), "--a [TAB]"),
+        snapbox::str![[r#"
+--a
+--help	Print help
+"#]],
+    );
+
+    // A multiple(true) group lets its members coexist.
+    let mut cmd = Command::new("exhaustive")
+        .arg(clap::Arg::new("a").long("a").action(clap::ArgAction::SetTrue))
+        .arg(clap::Arg::new("b").long("b").action(clap::ArgAction::SetTrue))
+        .group(clap::ArgGroup::new("ab").args(["a", "b"]).multiple(true));
+    assert_data_eq!(
+        complete!(cmd, "--a [TAB]"),
+        snapbox::str![[r#"
+--a
+--b
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
+fn suggest_keeps_overrides_with_candidates() {
+    let mut cmd = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("color")
+                .long("color")
+                .action(clap::ArgAction::SetTrue)
+                .overrides_with("mono"),
+        )
+        .arg(
+            clap::Arg::new("mono")
+                .long("mono")
+                .action(clap::ArgAction::SetTrue),
+        );
+
+    // `overrides_with` is not a conflict: both options stay available.
+    assert_data_eq!(
+        complete!(cmd, "--color [TAB]"),
+        snapbox::str![[r#"
+--color
+--mono
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
+fn suggest_no_options_after_escape_with_conflicts() {
+    let mut cmd = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("positional").value_parser(["pos-a", "pos-b", "pos-c"]),
+        )
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("safe")
+                .long("safe")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("fast"),
+        );
+
+    // After `--` only positional arguments are completed, conflicts or not.
+    assert_data_eq!(
+        complete!(cmd, "--fast -- [TAB]"),
+        snapbox::str![[r#"
+pos-a
+pos-b
+pos-c
+"#]],
+    );
+}
+
+#[test]
+fn complete_no_binary_name_keeps_first_arg() {
+    fn command() -> Command {
+        Command::new("exhaustive")
+            .no_binary_name(true)
+            .arg(
+                clap::Arg::new("fast")
+                    .long("fast")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                clap::Arg::new("safe")
+                    .long("safe")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("fast"),
+            )
+    }
+
+    let mut cmd = command();
+    let completions =
+        clap_complete::engine::complete(&mut cmd, vec!["--fast".into(), "".into()], 1, None)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.get_value().to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+    assert_eq!(completions, vec!["--fast", "--help"]);
+
+    // Without `no_binary_name`, `args[0]` is the binary name and skipped, so
+    // `--fast` is not part of the completed command line.
+    let mut cmd = command().no_binary_name(false);
+    let completions =
+        clap_complete::engine::complete(&mut cmd, vec!["--fast".into(), "".into()], 1, None)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.get_value().to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+    assert!(completions.contains(&"--fast".to_owned()));
+    assert!(completions.contains(&"--safe".to_owned()));
+}
+
+#[test]
+fn complete_without_word_is_error() {
+    let mut cmd = Command::new("exhaustive").arg(
+        clap::Arg::new("fast")
+            .long("fast")
+            .action(clap::ArgAction::SetTrue),
+    );
+    let err = clap_complete::engine::complete(
+        &mut cmd,
+        vec![std::ffi::OsString::from("exhaustive"), "--fast".into()],
+        2,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), "no completion generated");
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];

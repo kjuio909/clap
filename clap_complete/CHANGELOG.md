@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- *(dynamic)* Hide completion candidates that conflict with options already present on the command line
+
 ## [4.6.10] - 2026-09-14
 
 ## [4.6.9] - 2026-08-06

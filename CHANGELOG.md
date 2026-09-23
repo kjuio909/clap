@@ -24,6 +24,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- Add `Arg::get_conflicts_with`, `ArgGroup::get_conflicts_with`, and `ArgGroup::is_multiple_set` for reflecting on argument conflict relationships
+
 ## [4.6.7] - 2026-09-14
 
 ### Features

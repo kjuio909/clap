@@ -526,6 +526,18 @@ impl ArgGroup {
     pub fn is_required_set(&self) -> bool {
         self.required
     }
+
+    /// Reports whether [`ArgGroup::multiple`] is set
+    #[inline]
+    pub fn is_multiple_set(&self) -> bool {
+        self.multiple
+    }
+
+    /// Get the arguments and groups that conflict with this group
+    #[inline]
+    pub fn get_conflicts_with(&self) -> impl Iterator<Item = &Id> + Clone {
+        self.conflicts.iter()
+    }
 }
 
 impl From<&'_ Self> for ArgGroup {
