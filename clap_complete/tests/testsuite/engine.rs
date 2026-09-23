@@ -1531,6 +1531,307 @@ pos-c
     );
 }
 
+#[test]
+fn suggest_conflicts() {
+    let mut cmd = Command::new("dynamic")
+        .arg(
+            clap::Arg::new("safe")
+                .long("safe")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("safe"),
+        )
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("file")
+                .long("file")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .group(
+            clap::ArgGroup::new("payload")
+                .args(["tag", "file"])
+                .conflicts_with("fast"),
+        );
+
+    // `fast` conflicts with `safe` and with the `payload` group; the present flag is kept.
+    assert_data_eq!(
+        complete!(cmd, "--fast [TAB]"),
+        snapbox::str![[r#"
+--fast
+--help	Print help
+"#]]
+    );
+
+    // `tag` excludes fellow `payload` member `file` and, via the group, `fast`; the reverse
+    // `fast` -> `safe` conflict does not suppress `safe`.
+    assert_data_eq!(
+        complete!(cmd, "--tag [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]]
+    );
+
+    // Reverse direction of `fast.conflicts_with(safe)`.
+    assert_data_eq!(
+        complete!(cmd, "--safe [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--file
+--help	Print help
+"#]]
+    );
+
+    // Fellow member of a `multiple(false)` group is filtered while itself is present.
+    assert_data_eq!(
+        complete!(cmd, "--file [TAB]"),
+        snapbox::str![[r#"
+--safe
+--file
+--help	Print help
+"#]]
+    );
+
+    // Prefix completion filters the same way.
+    assert_data_eq!(
+        complete!(cmd, "--f[TAB]"),
+        snapbox::str![[r#"
+--fast
+--file
+"#]]
+    );
+    assert_data_eq!(complete!(cmd, "--fast --sa[TAB]"), snapbox::str![""]);
+    // After `--tag`, both `--fast` (group conflict) and `--file` (fellow group member) are gone.
+    assert_data_eq!(complete!(cmd, "--tag --f[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(cmd, "--tag --s[TAB]"), snapbox::str!["--safe"]);
+}
+
+#[test]
+fn suggest_conflict_short_flags() {
+    let mut cmd = Command::new("dynamic")
+        .arg(
+            clap::Arg::new("safe")
+                .short('s')
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("fast")
+                .short('f')
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("safe"),
+        );
+
+    assert_data_eq!(
+        complete!(cmd, "-f [TAB]"),
+        snapbox::str![[r#"
+-f
+--help	Print help
+"#]]
+    );
+
+    assert_data_eq!(
+        complete!(cmd, "-s [TAB]"),
+        snapbox::str![[r#"
+-s
+--help	Print help
+"#]]
+    );
+
+    // Completing the `-f` token itself keeps it (no explicit set entry yet), so `-s` is still
+    // offered there; the conflict only kicks in once `-f` is a prior token (see the cases above).
+    assert_data_eq!(
+        complete!(cmd, "-f[TAB]"),
+        snapbox::str![[r#"
+-fs
+-ff
+-fh	Print help
+"#]]
+    );
+}
+
+#[test]
+fn suggest_conflict_aliases() {
+    let mut cmd = Command::new("dynamic")
+        .arg(
+            clap::Arg::new("safe")
+                .long("safe")
+                .visible_alias("secure")
+                .alias("safe-hidden")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("safe"),
+        );
+
+    assert_data_eq!(
+        complete!(cmd, "--fast [TAB]"),
+        snapbox::str![[r#"
+--fast
+--help	Print help
+"#]]
+    );
+
+    // Neither visible nor hidden aliases of a disabled argument are completed.
+    assert_data_eq!(complete!(cmd, "--fast --sec[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(cmd, "--fast --safe-h[TAB]"), snapbox::str![""]);
+}
+
+#[test]
+fn suggest_conflict_values() {
+    let mut cmd = Command::new("dynamic")
+        .arg(
+            clap::Arg::new("color")
+                .long("color")
+                .value_parser(["always", "auto", "never"]),
+        )
+        .arg(
+            clap::Arg::new("plain")
+                .long("plain")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("color"),
+        );
+
+    // The disabled option's values are not completed when the option is only referenced by the
+    // token being completed...
+    assert_data_eq!(complete!(cmd, "--plain --color=[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(cmd, "--plain --color=a[TAB]"), snapbox::str![""]);
+
+    // ...but once `--color` is an explicit prior token, it keeps its own value candidates.
+    assert_data_eq!(
+        complete!(cmd, "--plain --color [TAB]"),
+        snapbox::str![[r#"
+always
+auto
+never
+"#]]
+    );
+
+    // The option name is filtered from the general option suggestions.
+    assert_data_eq!(
+        complete!(cmd, "--plain [TAB]"),
+        snapbox::str![[r#"
+--plain
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(complete!(cmd, "--plain --col[TAB]"), snapbox::str![""]);
+}
+
+#[test]
+fn suggest_conflicts_overrides_with_ignored() {
+    let mut cmd = Command::new("dynamic")
+        .arg(
+            clap::Arg::new("first")
+                .long("first")
+                .action(clap::ArgAction::SetTrue)
+                .overrides_with("second"),
+        )
+        .arg(
+            clap::Arg::new("second")
+                .long("second")
+                .action(clap::ArgAction::SetTrue),
+        );
+
+    assert_data_eq!(
+        complete!(cmd, "--first [TAB]"),
+        snapbox::str![[r#"
+--first
+--second
+--help	Print help
+"#]]
+    );
+}
+
+#[test]
+fn suggest_conflicts_default_values_ignored() {
+    let mut cmd = Command::new("dynamic")
+        .arg(
+            clap::Arg::new("mode")
+                .long("mode")
+                .value_parser(["auto", "fast"])
+                .default_value("auto")
+                .conflicts_with("safe"),
+        )
+        .arg(
+            clap::Arg::new("safe")
+                .long("safe")
+                .action(clap::ArgAction::SetTrue),
+        );
+
+    // `mode` is not explicitly present, so its default must not disable `safe`.
+    assert_data_eq!(
+        complete!(cmd, " [TAB]"),
+        snapbox::str![[r#"
+--mode
+--safe
+--help	Print help
+"#]]
+    );
+}
+
+#[test]
+fn suggest_conflicts_after_escape() {
+    let mut cmd = Command::new("dynamic")
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(clap::Arg::new("positional").value_parser(["pos_a", "pos_b"]));
+
+    // After `--` only positionals are completed, like without the flag.
+    assert_data_eq!(
+        complete!(cmd, "--fast -- [TAB]"),
+        snapbox::str![[r#"
+pos_a
+pos_b
+"#]]
+    );
+}
+
+#[test]
+fn suggest_conflicts_no_binary_name() {
+    let mut cmd = Command::new("dynamic")
+        .no_binary_name(true)
+        .arg(
+            clap::Arg::new("safe")
+                .long("safe")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("safe"),
+        );
+
+    // With `no_binary_name`, `args[0]` is parsed as the first option rather than skipped.
+    let completions = clap_complete::engine::complete(
+        &mut cmd,
+        vec!["--fast".into(), std::ffi::OsString::new()],
+        1,
+        None,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|candidate| candidate.get_value().to_str().unwrap().to_owned())
+    .collect::<Vec<_>>();
+    assert_eq!(completions, vec!["--fast", "--help"]);
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];

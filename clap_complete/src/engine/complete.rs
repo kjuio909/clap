@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::ffi::OsString;
 
@@ -41,6 +42,9 @@ pub fn complete(
     let mut pos_index = 1;
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
+    // Option names explicitly present in `args[..arg_index]` of `current_cmd`.
+    // Values, positionals, tokens after `--`, defaults and env values are not tracked.
+    let mut explicit_opts = HashSet::new();
     while let Some(arg) = raw_args.next(&mut cursor) {
         let current_state = next_state;
         next_state = ParseState::ValueDone;
@@ -49,6 +53,7 @@ pub fn complete(
             arg.to_value_os(),
         );
         if cursor == target_cursor {
+            let disabled = disabled_args(current_cmd, &explicit_opts);
             return complete_arg(
                 &arg,
                 current_cmd,
@@ -56,6 +61,7 @@ pub fn complete(
                 pos_index,
                 is_escaped,
                 current_state,
+                &disabled,
             );
         }
 
@@ -63,6 +69,7 @@ pub fn complete(
             if let Some(next_cmd) = current_cmd.find_subcommand(value) {
                 current_cmd = next_cmd;
                 pos_index = 1;
+                explicit_opts.clear();
                 continue;
             }
         }
@@ -90,6 +97,7 @@ pub fn complete(
                 });
 
                 if let Some(opt) = opt {
+                    explicit_opts.insert(opt.get_id().to_string());
                     if opt.get_num_args().expect("built").takes_values() && value.is_none() {
                         next_state = ParseState::Opt((opt, 1));
                     };
@@ -99,8 +107,14 @@ pub fn complete(
                 }
             }
         } else if let Some(short) = arg.to_short() {
-            let (_, takes_value_opt, mut short) = parse_shortflags(current_cmd, short);
+            let (leading_flags, takes_value_opt, mut short) = parse_shortflags(current_cmd, short);
+            for flag in leading_flags.chars() {
+                if let Some(opt) = find_short_arg(current_cmd, flag) {
+                    explicit_opts.insert(opt.get_id().to_string());
+                }
+            }
             if let Some(opt) = takes_value_opt {
+                explicit_opts.insert(opt.get_id().to_string());
                 if short.next_value_os().is_none() {
                     next_state = ParseState::Opt((opt, 1));
                 }
@@ -141,6 +155,7 @@ fn complete_arg(
     pos_index: usize,
     is_escaped: bool,
     state: ParseState<'_>,
+    disabled_args: &HashSet<String>,
 ) -> Result<Vec<CompletionCandidate>, std::io::Error> {
     debug!(
         "complete_arg: arg={:?}, cmd={:?}, current_dir={:?}, pos_index={:?}, state={:?}",
@@ -161,6 +176,7 @@ fn complete_arg(
             if let Some(positional) = cmd
                 .get_positionals()
                 .find(|p| p.get_index() == Some(pos_index))
+                .filter(|p| !disabled_args.contains(p.get_id().as_str()))
             {
                 completions.extend(complete_arg_value(
                     arg.to_value(),
@@ -170,13 +186,14 @@ fn complete_arg(
                 ));
             }
             if !is_escaped {
-                completions.extend(complete_option(arg, cmd, current_dir));
+                completions.extend(complete_option(arg, cmd, current_dir, disabled_args));
             }
         }
         ParseState::Pos((_, num_arg)) => {
             if let Some(positional) = cmd
                 .get_positionals()
                 .find(|p| p.get_index() == Some(pos_index))
+                .filter(|p| !disabled_args.contains(p.get_id().as_str()))
             {
                 completions.extend(complete_arg_value(
                     arg.to_value(),
@@ -189,17 +206,19 @@ fn complete_arg(
                         .get_num_args()
                         .is_some_and(|num_args| num_arg >= num_args.min_values())
                 {
-                    completions.extend(complete_option(arg, cmd, current_dir));
+                    completions.extend(complete_option(arg, cmd, current_dir, disabled_args));
                 }
             }
         }
         ParseState::Opt((opt, count)) => {
-            completions.extend(complete_arg_value(
-                arg.to_value(),
-                opt,
-                current_dir,
-                count.saturating_sub(1),
-            ));
+            if !disabled_args.contains(opt.get_id().as_str()) {
+                completions.extend(complete_arg_value(
+                    arg.to_value(),
+                    opt,
+                    current_dir,
+                    count.saturating_sub(1),
+                ));
+            }
             let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
             if count > min {
                 // Also complete this raw_arg as a positional argument, flags, options and subcommand.
@@ -210,6 +229,7 @@ fn complete_arg(
                     pos_index,
                     is_escaped,
                     ParseState::ValueDone,
+                    disabled_args,
                 )?);
             }
         }
@@ -217,7 +237,7 @@ fn complete_arg(
     if completions.iter().any(|a| !a.is_hide_set()) {
         completions.retain(|a| !a.is_hide_set());
     }
-    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_ids = HashSet::new();
     completions.retain(move |a| {
         if let Some(id) = a.get_id().cloned() {
             seen_ids.insert(id)
@@ -247,9 +267,18 @@ fn complete_option(
     arg: &clap_lex::ParsedArg<'_>,
     cmd: &clap::Command,
     current_dir: Option<&std::path::Path>,
+    disabled_args: &HashSet<String>,
 ) -> Vec<CompletionCandidate> {
     debug!("complete_option: arg={arg:?}, current_dir={current_dir:?}");
     let mut completions = Vec::<CompletionCandidate>::new();
+    let retain_arg = |comp: &CompletionCandidate| {
+        if let Some(id) = comp.get_id() {
+            if let Some(id) = disabled_arg_from_candidate_id(id) {
+                return !disabled_args.contains(id);
+            }
+        }
+        true
+    };
     if arg.is_empty() {
         completions.extend(longs_and_visible_aliases(cmd));
         completions.extend(hidden_longs_aliases(cmd));
@@ -286,7 +315,11 @@ fn complete_option(
     } else if let Some((flag, value)) = arg.to_long() {
         if let Ok(flag) = flag {
             if let Some(value) = value {
-                if let Some(arg) = cmd.get_arguments().find(|a| a.get_long() == Some(flag)) {
+                if let Some(arg) = cmd
+                    .get_arguments()
+                    .find(|a| a.get_long() == Some(flag))
+                    .filter(|a| !disabled_args.contains(a.get_id().as_str()))
+                {
                     completions.extend(
                         complete_arg_value(value.to_str().ok_or(value), arg, current_dir, 0)
                             .into_iter()
@@ -312,7 +345,9 @@ fn complete_option(
             let (leading_flags, takes_value_opt, mut short) = parse_shortflags(cmd, short);
 
             // Clone `short` to `peek_short` to peek whether the next flag is a `=`.
-            if let Some(opt) = takes_value_opt {
+            if let Some(opt) =
+                takes_value_opt.filter(|o| !disabled_args.contains(o.get_id().as_str()))
+            {
                 let mut peek_short = short.clone();
                 let has_equal = if let Some(Ok('=')) = peek_short.next_flag() {
                     short.next_flag();
@@ -339,8 +374,14 @@ fn complete_option(
             }
         }
     }
+    completions.retain(retain_arg);
     debug!("complete_option: completions={completions:?}");
     completions
+}
+
+/// Extract the argument id from a candidate id of the form `arg::<id>`.
+fn disabled_arg_from_candidate_id(candidate_id: &str) -> Option<&str> {
+    candidate_id.strip_prefix("arg::")
 }
 
 fn complete_arg_value(
@@ -652,6 +693,108 @@ fn parse_shortflags<'c, 's>(
     }
 
     (leading_flags, takes_value_opt, short)
+}
+
+/// Find the argument for a short flag, considering visible aliases.
+fn find_short_arg(cmd: &clap::Command, flag: char) -> Option<&clap::Arg> {
+    cmd.get_arguments().find(|a| {
+        let shorts = a.get_short_and_visible_aliases();
+        shorts.is_some_and(|v| v.into_iter().any(|s| s == flag))
+    })
+}
+
+/// Compute the arguments that cannot be used alongside the options already present.
+///
+/// This mirrors clap's conflict validation:
+/// - [`Arg::conflicts_with`][clap::Arg::conflicts_with] /
+///   [`Arg::conflicts_with_all`][clap::Arg::conflicts_with_all]
+/// - [`ArgGroup::conflicts_with`][clap::ArgGroup::conflicts_with] /
+///   [`ArgGroup::conflicts_with_all`][clap::ArgGroup::conflicts_with_all]
+/// - fellow members of a `multiple(false)` group
+///
+/// Rules apply in both directions and group ids are unrolled to their member arguments.
+/// `overrides_with` is intentionally ignored.
+fn disabled_args(cmd: &clap::Command, explicit_opts: &HashSet<String>) -> HashSet<String> {
+    fn unroll(cmd: &clap::Command, id: &str) -> Vec<String> {
+        let mut groups = vec![id.to_owned()];
+        let mut args = Vec::new();
+        while let Some(group_id) = groups.pop() {
+            if let Some(group) = cmd.get_groups().find(|g| g.get_id().as_str() == group_id) {
+                for member in group.get_args() {
+                    let member = member.as_str();
+                    if !args.contains(&member.to_owned()) && !groups.iter().any(|g| g == member) {
+                        if cmd.get_arguments().any(|a| a.get_id() == member) {
+                            args.push(member.to_owned());
+                        } else {
+                            groups.push(member.to_owned());
+                        }
+                    }
+                }
+            } else {
+                // It names an argument directly.
+                args.push(group_id);
+            }
+        }
+        args
+    }
+
+    /// Direct conflicts of an argument: its own, those of its groups, and fellow members of
+    /// non-multiple groups. Mirrors `gather_arg_direct_conflicts` in clap's validator.
+    fn direct_conflicts(cmd: &clap::Command, arg: &clap::Arg) -> Vec<String> {
+        let mut conflicts: Vec<String> = arg
+            .get_conflicts()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        for group in cmd
+            .get_groups()
+            .filter(|g| g.get_args().any(|a| a == arg.get_id()))
+        {
+            conflicts.extend(group.get_conflicts().map(|id| id.as_str().to_owned()));
+            if !group.is_multiple_set() {
+                conflicts.extend(
+                    group
+                        .get_args()
+                        .filter(|a| *a != arg.get_id())
+                        .map(|a| a.as_str().to_owned()),
+                );
+            }
+        }
+        conflicts
+    }
+
+    let mut disabled = HashSet::new();
+    for present in explicit_opts {
+        let Some(present_arg) = cmd
+            .get_arguments()
+            .find(|a| a.get_id().as_str() == present.as_str())
+        else {
+            continue;
+        };
+
+        // Anything the present argument (or one of its groups) conflicts with.
+        for conflict in direct_conflicts(cmd, present_arg) {
+            disabled.extend(unroll(cmd, &conflict));
+        }
+
+        // Reverse direction: an argument that conflicts with the present one.
+        for arg in cmd
+            .get_arguments()
+            .filter(|a| a.get_id() != present_arg.get_id())
+        {
+            if direct_conflicts(cmd, arg)
+                .iter()
+                .any(|conflict| unroll(cmd, conflict).iter().any(|a| a == present))
+            {
+                disabled.insert(arg.get_id().as_str().to_owned());
+            }
+        }
+    }
+    // Present arguments keep their own option, aliases and value candidates.
+    for present in explicit_opts {
+        disabled.remove(present);
+    }
+    debug!("disabled_args: explicit={explicit_opts:?}, disabled={disabled:?}");
+    disabled
 }
 
 /// Parse the positional arguments. Return the new state and the new positional index.

@@ -526,6 +526,25 @@ impl ArgGroup {
     pub fn is_required_set(&self) -> bool {
         self.required
     }
+
+    /// Reports whether [`ArgGroup::multiple`] is set
+    #[inline]
+    #[cfg(feature = "unstable-ext")]
+    pub fn is_multiple_set(&self) -> bool {
+        self.multiple
+    }
+
+    /// Report the [`Arg`]s and [`ArgGroup`]s that conflict with this one
+    ///
+    /// The returned ids may name either arguments or groups; group ids are not unrolled to their
+    /// member arguments.
+    ///
+    /// [`Arg`]: crate::Arg
+    /// [`ArgGroup`]: crate::ArgGroup
+    #[cfg(feature = "unstable-ext")]
+    pub fn get_conflicts(&self) -> impl Iterator<Item = &Id> {
+        self.conflicts.iter()
+    }
 }
 
 impl From<&'_ Self> for ArgGroup {

@@ -4180,6 +4180,15 @@ impl Arg {
         &self.id
     }
 
+    /// Report the [`Arg`]s and [`ArgGroup`][crate::ArgGroup]s that conflict with this one
+    ///
+    /// The returned ids may name either arguments or groups; group ids are not unrolled to their
+    /// member arguments.
+    #[cfg(feature = "unstable-ext")]
+    pub fn get_conflicts(&self) -> impl Iterator<Item = &Id> {
+        self.conflicts.iter()
+    }
+
     /// Get the help specified for this argument, if any
     #[inline]
     pub fn get_help(&self) -> Option<&StyledStr> {
