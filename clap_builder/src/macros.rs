@@ -193,6 +193,112 @@ macro_rules! arg_impl {
         None
     }};
 
+    // Number of value names declared so far
+    ( @value_name_count $arg:expr ) => {{
+        $arg.get_value_names().map(|names| names.len()).unwrap_or(0)
+    }};
+
+    // Number of the already-declared value names that are required
+    //
+    // The first value name does not set `num_args`, so recover the count from
+    // `required` (positionals) or the presence of flags (named arguments).
+    ( @required_value_name_count $arg:expr ) => {{
+        match $arg.get_num_args() {
+            Some(range) => range.min_values(),
+            None => {
+                let total = $crate::arg_impl! { @value_name_count $arg };
+                if total == 0 {
+                    0
+                } else if $arg.is_required_set() {
+                    total
+                } else if $arg.get_long().is_some() || $arg.get_short().is_some() {
+                    1
+                } else {
+                    0
+                }
+            }
+        }
+    }};
+
+    (
+        @arg
+        ($arg:expr)
+        @required_value_name ($value_name:expr)
+        $($tail:tt)*
+    ) => {{
+        debug_assert!(!matches!($arg.get_action(), $crate::ArgAction::Append), "Flags should precede `...`");
+
+        let total = $crate::arg_impl! { @value_name_count $arg };
+        let required = $crate::arg_impl! { @required_value_name_count $arg };
+        debug_assert_eq!(
+            required,
+            total,
+            "Required value names must precede optional value names",
+        );
+
+        let mut arg = $arg;
+
+        if arg.get_long().is_none() && arg.get_short().is_none() {
+            arg = arg.required(true);
+        }
+
+        let value_name: &str = $value_name;
+        if arg.get_id() == "" {
+            arg = arg.id(value_name);
+        }
+
+        if 0 < total {
+            arg = arg.num_args((required + 1)..=(total + 1));
+        }
+
+        let mut value_names = arg.get_value_names().map(|names| names.to_vec()).unwrap_or_default();
+        value_names.push(value_name.into());
+        let arg = arg
+            .value_names(value_names)
+            .action($crate::ArgAction::Set);
+        let arg = $crate::arg_impl! {
+            @arg (arg) $($tail)*
+        };
+        arg
+    }};
+    (
+        @arg
+        ($arg:expr)
+        @optional_value_name ($value_name:expr)
+        $($tail:tt)*
+    ) => {{
+        debug_assert!(!matches!($arg.get_action(), $crate::ArgAction::Append), "Flags should precede `...`");
+
+        let mut arg = $arg;
+
+        let total = $crate::arg_impl! { @value_name_count arg };
+        let required = $crate::arg_impl! { @required_value_name_count arg };
+        if total == 0 {
+            if arg.get_long().is_none() && arg.get_short().is_none() {
+                arg = arg.required(false);
+            } else {
+                arg = arg.num_args(0..=1);
+            }
+        } else {
+            arg = arg.num_args(required..=(total + 1));
+        }
+
+        let value_name: &str = $value_name;
+        if arg.get_id() == "" {
+            arg = arg.id(value_name);
+        }
+
+        let mut value_names = arg.get_value_names().map(|names| names.to_vec()).unwrap_or_default();
+        value_names.push(value_name.into());
+        let arg = arg
+            .value_names(value_names)
+            .action($crate::ArgAction::Set);
+        let arg = $crate::arg_impl! {
+            @arg (arg) $($tail)*
+        };
+        arg
+    }};
+
     (
         @arg
         ($arg:expr)
@@ -283,26 +389,10 @@ macro_rules! arg_impl {
         <$value_name:ident>
         $($tail:tt)*
     ) => {{
-        debug_assert!(!matches!($arg.get_action(), $crate::ArgAction::Append), "Flags should precede `...`");
-        debug_assert_eq!($arg.get_value_names(), None, "Multiple values not yet supported");
-
-        let mut arg = $arg;
-
-        if arg.get_long().is_none() && arg.get_short().is_none() {
-            arg = arg.required(true);
-        }
-
         let value_name = $crate::arg_impl! { @string $value_name };
-        if arg.get_id() == "" {
-            arg = arg.id(value_name);
+        $crate::arg_impl! {
+            @arg ($arg) @required_value_name (value_name) $($tail)*
         }
-        let arg = arg
-            .value_name(value_name)
-            .action($crate::ArgAction::Set);
-        let arg = $crate::arg_impl! {
-            @arg (arg) $($tail)*
-        };
-        arg
     }};
     (
         @arg
@@ -310,26 +400,10 @@ macro_rules! arg_impl {
         <$value_name:literal>
         $($tail:tt)*
     ) => {{
-        debug_assert!(!matches!($arg.get_action(), $crate::ArgAction::Append), "Flags should precede `...`");
-        debug_assert_eq!($arg.get_value_names(), None, "Multiple values not yet supported");
-
-        let mut arg = $arg;
-
-        if arg.get_long().is_none() && arg.get_short().is_none() {
-            arg = arg.required(true);
-        }
-
         let value_name = $crate::arg_impl! { @string $value_name };
-        if arg.get_id() == "" {
-            arg = arg.id(value_name);
+        $crate::arg_impl! {
+            @arg ($arg) @required_value_name (value_name) $($tail)*
         }
-        let arg = arg
-            .value_name(value_name)
-            .action($crate::ArgAction::Set);
-        let arg = $crate::arg_impl! {
-            @arg (arg) $($tail)*
-        };
-        arg
     }};
     (
         @arg
@@ -337,28 +411,10 @@ macro_rules! arg_impl {
         [$value_name:ident]
         $($tail:tt)*
     ) => {{
-        debug_assert!(!matches!($arg.get_action(), $crate::ArgAction::Append), "Flags should precede `...`");
-        debug_assert_eq!($arg.get_value_names(), None, "Multiple values not yet supported");
-
-        let mut arg = $arg;
-
-        if arg.get_long().is_none() && arg.get_short().is_none() {
-            arg = arg.required(false);
-        } else {
-            arg = arg.num_args(0..=1);
-        }
-
         let value_name = $crate::arg_impl! { @string $value_name };
-        if arg.get_id() == "" {
-            arg = arg.id(value_name);
+        $crate::arg_impl! {
+            @arg ($arg) @optional_value_name (value_name) $($tail)*
         }
-        let arg = arg
-            .value_name(value_name)
-            .action($crate::ArgAction::Set);
-        let arg = $crate::arg_impl! {
-            @arg (arg) $($tail)*
-        };
-        arg
     }};
     (
         @arg
@@ -366,28 +422,10 @@ macro_rules! arg_impl {
         [$value_name:literal]
         $($tail:tt)*
     ) => {{
-        debug_assert!(!matches!($arg.get_action(), $crate::ArgAction::Append), "Flags should precede `...`");
-        debug_assert_eq!($arg.get_value_names(), None, "Multiple values not yet supported");
-
-        let mut arg = $arg;
-
-        if arg.get_long().is_none() && arg.get_short().is_none() {
-            arg = arg.required(false);
-        } else {
-            arg = arg.num_args(0..=1);
-        }
-
         let value_name = $crate::arg_impl! { @string $value_name };
-        if arg.get_id() == "" {
-            arg = arg.id(value_name);
+        $crate::arg_impl! {
+            @arg ($arg) @optional_value_name (value_name) $($tail)*
         }
-        let arg = arg
-            .value_name(value_name)
-            .action($crate::ArgAction::Set);
-        let arg = $crate::arg_impl! {
-            @arg (arg) $($tail)*
-        };
-        arg
     }};
     (
         @arg
@@ -398,7 +436,12 @@ macro_rules! arg_impl {
         let arg = match $arg.get_action() {
             $crate::ArgAction::Set => {
                 if $arg.get_long().is_none() && $arg.get_short().is_none() {
-                    $arg.num_args(1..)
+                    let min = $arg
+                        .get_num_args()
+                        .map(|range| range.min_values())
+                        .unwrap_or(1)
+                        .max(1);
+                    $arg.num_args(min..)
                         // Allow collecting arguments interleaved with flags
                         .action($crate::ArgAction::Append)
                 } else {
@@ -494,7 +537,13 @@ macro_rules! arg_impl {
 ///   - Named argument: optional value
 /// - `<>` like `<FOO>`: required
 ///
-/// See [`Arg::value_name`][crate::Arg::value_name].
+/// Multiple value names may be declared for a single argument, like
+/// `--copy <SRC> <DST> [MODE]`.  The number of values is inferred from the
+/// value names (`2..=3` in this example) and required value names must come
+/// before optional ones.
+///
+/// See [`Arg::value_name`][crate::Arg::value_name] and
+/// [`Arg::value_names`][crate::Arg::value_names].
 ///
 /// ### `...`
 ///
