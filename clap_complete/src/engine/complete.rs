@@ -74,7 +74,7 @@ pub fn complete(
             is_escaped = true;
         } else if opt_allows_hyphen(&current_state, &arg) {
             match current_state {
-                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count, &arg),
                 _ => unreachable!("else branch is only reachable in Opt state"),
             }
         } else if let Some((flag, value)) = arg.to_long() {
@@ -114,7 +114,7 @@ pub fn complete(
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
-                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count, &arg),
             }
         }
     }
@@ -706,7 +706,19 @@ fn parse_positional<'a>(
 }
 
 /// Parse optional flag argument. Return new state
-fn parse_opt_value(opt: &clap::Arg, count: usize) -> ParseState<'_> {
+fn parse_opt_value<'a>(
+    opt: &'a clap::Arg,
+    count: usize,
+    arg: &clap_lex::ParsedArg<'_>,
+) -> ParseState<'a> {
+    if opt
+        .get_value_terminator()
+        .is_some_and(|term| arg.to_value_os() == term.as_str())
+    {
+        // The terminator ends the value stream without being consumed as a value
+        return ParseState::ValueDone;
+    }
+
     let range = opt.get_num_args().expect("built");
     let max = range.max_values();
     if count < max {

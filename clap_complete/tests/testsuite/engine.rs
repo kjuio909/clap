@@ -531,6 +531,114 @@ val3
 }
 
 #[test]
+fn suggest_argument_value_terminator() {
+    fn tool() -> Command {
+        Command::new("tool")
+            .arg(
+                clap::Arg::new("pair")
+                    .long("pair")
+                    .num_args(1..=3)
+                    .value_terminator(";")
+                    .add(ArgValueCandidates::new(|| {
+                        vec![
+                            CompletionCandidate::new("pair-a"),
+                            CompletionCandidate::new("pair-b"),
+                            CompletionCandidate::new("pair-c"),
+                        ]
+                    })),
+            )
+            .arg(clap::Arg::new("tail").value_parser(["tail-a", "tail-b", ";x"]))
+            .arg(clap::Arg::new("verbose").long("verbose"))
+    }
+
+    // `A#i` is args=A and arg_index=i
+    fn complete_direct(
+        args: &[&str],
+        arg_index: usize,
+    ) -> Result<Vec<CompletionCandidate>, std::io::Error> {
+        let mut cmd = tool();
+        clap_complete::engine::complete(
+            &mut cmd,
+            args.iter().map(Into::into).collect(),
+            arg_index,
+            None,
+        )
+    }
+
+    // The terminator ends the value stream, later values are still completed.
+    assert_data_eq!(
+        complete!(tool(), "--pair [TAB]"),
+        snapbox::str![[r#"
+pair-a
+pair-b
+pair-c
+"#]]
+    );
+
+    // The terminator itself is only a separator and transitions to the trailing values.
+    assert_data_eq!(
+        complete!(tool(), "--pair pair-a ; [TAB]"),
+        snapbox::str![[r#"
+tail-a
+tail-b
+;x
+--pair
+--verbose
+--help	Print help
+"#]]
+    );
+
+    // A value merely containing the terminator is not the terminator and no longer matches.
+    assert_data_eq!(complete!(tool(), "--pair semi;[TAB]"), snapbox::str![]);
+
+    // After `--` the terminator is parsed as a regular positional value.
+    assert_data_eq!(complete!(tool(), "--pair pair-a ; -- ;[TAB]"), snapbox::str![";x"]);
+
+    // Nothing is being completed, so completion errors without partial candidates.
+    assert!(complete_direct(&["tool", "--pair"], 2).is_err());
+
+    // Candidate metadata after the terminator matches that of a fresh command line.
+    fn metadata(
+        candidate: &CompletionCandidate,
+    ) -> (
+        Option<&clap::builder::StyledStr>,
+        Option<&String>,
+        Option<&clap::builder::StyledStr>,
+        Option<usize>,
+        bool,
+    ) {
+        (
+            candidate.get_help(),
+            candidate.get_id(),
+            candidate.get_tag(),
+            candidate.get_display_order(),
+            candidate.is_hide_set(),
+        )
+    }
+
+    let terminated = complete_direct(&["tool", "--pair", "pair-a", ";", ""], 4).unwrap();
+    let fresh = complete_direct(&["tool", ""], 1).unwrap();
+    assert_eq!(
+        terminated.iter().map(|c| c.get_value()).collect::<Vec<_>>(),
+        fresh.iter().map(|c| c.get_value()).collect::<Vec<_>>()
+    );
+    for (terminated, fresh) in terminated.iter().zip(fresh.iter()) {
+        assert_eq!(metadata(terminated), metadata(fresh));
+    }
+
+    let terminated = complete_direct(&["tool", "--pair", "pair-a", ";", "--", ";"], 5).unwrap();
+    let semicolon = terminated
+        .iter()
+        .find(|c| c.get_value() == ";x")
+        .expect(";x candidate");
+    let semicolon_fresh = fresh
+        .iter()
+        .find(|c| c.get_value() == ";x")
+        .expect(";x candidate");
+    assert_eq!(metadata(semicolon), metadata(semicolon_fresh));
+}
+
+#[test]
 fn suggest_value_hint_file_path() {
     let mut cmd = Command::new("dynamic")
         .arg(
