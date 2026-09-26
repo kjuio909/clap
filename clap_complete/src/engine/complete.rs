@@ -96,10 +96,15 @@ pub fn complete(
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
+                } else {
+                    // Unknown long option; the command line is invalid and
+                    // nothing can be completed after it.
+                    return Ok(Vec::new());
                 }
             }
         } else if let Some(short) = arg.to_short() {
-            let (_, takes_value_opt, mut short) = parse_shortflags(current_cmd, short);
+            let (_, takes_value_opt, mut short, unknown_short) =
+                parse_shortflags(current_cmd, short);
             if let Some(opt) = takes_value_opt {
                 if short.next_value_os().is_none() {
                     next_state = ParseState::Opt((opt, 1));
@@ -107,10 +112,23 @@ pub fn complete(
             } else if pos_allows_hyphen(current_cmd, pos_index) {
                 (next_state, pos_index) =
                     parse_positional(current_cmd, pos_index, is_escaped, current_state);
+            } else if unknown_short {
+                // Unknown short option; the command line is invalid and
+                // nothing can be completed after it.
+                return Ok(Vec::new());
             }
         } else {
             match current_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
+                    if !current_cmd.is_allow_external_subcommands_set()
+                        && !current_cmd
+                            .get_positionals()
+                            .any(|p| p.get_index() == Some(pos_index))
+                    {
+                        // Unknown subcommand or excess positional; the command
+                        // line is invalid and nothing can be completed after it.
+                        return Ok(Vec::new());
+                    }
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
@@ -309,7 +327,13 @@ fn complete_option(
     } else if let Some(short) = arg.to_short() {
         if !short.is_negative_number() {
             // Find the first takes_values option.
-            let (leading_flags, takes_value_opt, mut short) = parse_shortflags(cmd, short);
+            let (leading_flags, takes_value_opt, mut short, unknown_short) =
+                parse_shortflags(cmd, short);
+
+            if unknown_short {
+                // Unknown short flag; there is nothing valid to complete.
+                return completions;
+            }
 
             // Clone `short` to `peek_short` to peek whether the next flag is a `=`.
             if let Some(opt) = takes_value_opt {
@@ -616,11 +640,15 @@ fn populate_command_candidate(
 }
 
 /// Parse the short flags and find the first `takes_values` option.
+///
+/// The returned `bool` is `true` when a short flag was encountered that does
+/// not exist on the command, making the token invalid.
 fn parse_shortflags<'c, 's>(
     cmd: &'c clap::Command,
     mut short: clap_lex::ShortFlags<'s>,
-) -> (String, Option<&'c clap::Arg>, clap_lex::ShortFlags<'s>) {
+) -> (String, Option<&'c clap::Arg>, clap_lex::ShortFlags<'s>, bool) {
     let takes_value_opt;
+    let mut unknown_short = false;
     let mut leading_flags = String::new();
     // Find the first takes_values option.
     loop {
@@ -636,22 +664,32 @@ fn parse_shortflags<'c, 's>(
                     });
                     is_find.unwrap_or(false)
                 });
-                if opt
-                    .map(|o| o.get_num_args().expect("built").takes_values())
-                    .unwrap_or(false)
-                {
-                    takes_value_opt = opt;
-                    break;
+                match opt {
+                    Some(opt) if opt.get_num_args().expect("built").takes_values() => {
+                        takes_value_opt = Some(opt);
+                        break;
+                    }
+                    Some(_) => {}
+                    None => {
+                        unknown_short = true;
+                        takes_value_opt = None;
+                        break;
+                    }
                 }
             }
-            Some(Err(_)) | None => {
+            Some(Err(_)) => {
+                unknown_short = true;
+                takes_value_opt = None;
+                break;
+            }
+            None => {
                 takes_value_opt = None;
                 break;
             }
         }
     }
 
-    (leading_flags, takes_value_opt, short)
+    (leading_flags, takes_value_opt, short, unknown_short)
 }
 
 /// Parse the positional arguments. Return the new state and the new positional index.
