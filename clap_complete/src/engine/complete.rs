@@ -21,6 +21,28 @@ pub fn complete(
     debug!("complete: args={args:?}, arg_index={arg_index:?}, current_dir={current_dir:?}");
     cmd.build();
 
+    let mut args = args;
+    if cmd.is_multicall_set() {
+        // The applet is selected through argv0; parse its file stem like a
+        // subcommand, mirroring `Command::try_get_matches_from_mut`.
+        if let Some(argv0) = args.first_mut() {
+            let applet = std::path::Path::new(&*argv0)
+                .file_stem()
+                .and_then(|f| f.to_str())
+                .map(str::to_owned);
+            if let Some(applet) = applet {
+                *argv0 = OsString::from(applet);
+            }
+        }
+        if arg_index > 0 {
+            match args.first().and_then(|argv0| cmd.find_subcommand(argv0)) {
+                Some(_) => {}
+                // The selected applet is not a known subcommand
+                None => return Ok(Vec::new()),
+            }
+        }
+    }
+
     let raw_args = clap_lex::RawArgs::new(args);
     let mut cursor = raw_args.cursor();
     let mut target_cursor = raw_args.cursor();
@@ -32,8 +54,7 @@ pub fn complete(
     raw_args.next_os(&mut target_cursor);
     debug!("complete: target_cursor={target_cursor:?}");
 
-    // TODO: Multicall support
-    if !cmd.is_no_binary_name_set() {
+    if !cmd.is_multicall_set() && !cmd.is_no_binary_name_set() {
         raw_args.next_os(&mut cursor);
     }
 
@@ -355,6 +376,42 @@ fn complete_arg_value(
     let (prefix, value) =
         rsplit_delimiter(value, arg.get_value_delimiter()).unwrap_or((None, value));
 
+    // When an occurrence accepts multiple delimiter-separated values, the segments
+    // already typed constrain what may follow: they must be valid, non-empty values,
+    // there must be room for another value, and values already used within this
+    // occurrence are not suggested again.
+    let mut committed_segments: Vec<&str> = Vec::new();
+    if let Some(prefix) = prefix {
+        let multi_valued = arg
+            .get_num_args()
+            .map(|range| range.max_values() > 1)
+            .unwrap_or(false);
+        if multi_valued {
+            let delimiter = arg.get_value_delimiter().expect("prefix implies delimiter");
+            let committed = &prefix[..prefix.len() - delimiter.len_utf8()];
+            committed_segments = committed.split(delimiter).collect();
+            let max_values = arg.get_num_args().expect("built").max_values();
+            if committed_segments.len() >= max_values
+                || committed_segments
+                    .iter()
+                    .any(|segment| segment.is_empty())
+            {
+                return Vec::new();
+            }
+            if let Some(possible_values) = possible_values(arg) {
+                let possible_values = possible_values
+                    .map(|value| value.get_name().to_owned())
+                    .collect::<Vec<_>>();
+                if committed_segments
+                    .iter()
+                    .any(|segment| !possible_values.iter().any(|value| value == segment))
+                {
+                    return Vec::new();
+                }
+            }
+        }
+    }
+
     let value_os = match value {
         Ok(value) => OsStr::new(value),
         Err(value_os) => value_os,
@@ -408,6 +465,14 @@ fn complete_arg_value(
         }
 
         values.sort();
+    }
+
+    if !committed_segments.is_empty() {
+        values.retain(|comp| {
+            !committed_segments
+                .iter()
+                .any(|segment| comp.get_value() == OsStr::new(segment))
+        });
     }
 
     if let Some(prefix) = prefix {

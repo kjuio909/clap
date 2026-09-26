@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- *(dynamic)* Select the applet from argv0 when `Command::multicall` is set
+- *(dynamic)* Validate committed delimiter-separated segments of multi-value arguments and don't re-suggest values already used within the same occurrence
+
 ## [4.6.10] - 2026-09-14
 
 ## [4.6.9] - 2026-08-06

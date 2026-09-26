@@ -1309,6 +1309,272 @@ a_pos,c_pos
     );
 }
 
+fn deploy_subcommand() -> Command {
+    Command::new("deploy")
+        .alias("d")
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .short('t')
+                .action(clap::ArgAction::Append)
+                .num_args(1..=2)
+                .value_delimiter(',')
+                .value_parser(["dev", "prod", "ci"]),
+        )
+        .arg(clap::Arg::new("target").value_parser(["all", "changed"]))
+}
+
+#[test]
+fn suggest_repeatable_delimiter_values() {
+    let mut cmd = Command::new("tool").subcommand(deploy_subcommand());
+
+    assert_data_eq!(
+        complete!(cmd, "deploy --tag [TAB]"),
+        snapbox::str![[r#"
+dev
+prod
+ci
+"#]]
+    );
+
+    assert_data_eq!(complete!(cmd, "deploy --tag d[TAB]"), snapbox::str!["dev"]);
+
+    assert_data_eq!(
+        complete!(cmd, "deploy --tag=de[TAB]"),
+        snapbox::str!["--tag=dev"]
+    );
+
+    assert_data_eq!(
+        complete!(cmd, "deploy --tag=dev,[TAB]"),
+        snapbox::str![[r#"
+--tag=dev,prod
+--tag=dev,ci
+"#]]
+    );
+
+    assert_data_eq!(
+        complete!(cmd, "deploy --tag dev,[TAB]"),
+        snapbox::str![[r#"
+dev,prod
+dev,ci
+"#]]
+    );
+
+    assert_data_eq!(
+        complete!(cmd, "deploy --tag=prod,[TAB]"),
+        snapbox::str![[r#"
+--tag=prod,dev
+--tag=prod,ci
+"#]]
+    );
+
+    assert_data_eq!(
+        complete!(cmd, "deploy -tdev,[TAB]"),
+        snapbox::str![[r#"
+-tdev,prod
+-tdev,ci
+"#]]
+    );
+
+    // A later occurrence of `--tag` starts over with all values
+    assert_data_eq!(
+        complete!(cmd, "deploy --tag dev,prod --tag [TAB]"),
+        snapbox::str![[r#"
+dev
+prod
+ci
+"#]]
+    );
+
+    assert_data_eq!(
+        complete!(cmd, "deploy --tag dev --tag [TAB]"),
+        snapbox::str![[r#"
+dev
+prod
+ci
+"#]]
+    );
+
+    // Too many values within one occurrence
+    assert_data_eq!(complete!(cmd, "deploy --tag=dev,prod,[TAB]"), snapbox::str![""]);
+    assert_data_eq!(
+        complete!(cmd, "deploy --tag=dev,prod,ci,[TAB]"),
+        snapbox::str![""]
+    );
+
+    // Empty segments are invalid
+    assert_data_eq!(complete!(cmd, "deploy --tag=dev,,[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(cmd, "deploy --tag=,[TAB]"), snapbox::str![""]);
+
+    // Unknown values and prefixes that match nothing
+    assert_data_eq!(complete!(cmd, "deploy --tag=staging,[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(cmd, "deploy --tag=deV[TAB]"), snapbox::str![""]);
+
+    assert_data_eq!(
+        complete!(cmd, "deploy -- [TAB]"),
+        snapbox::str![[r#"
+all
+changed
+"#]]
+    );
+}
+
+#[test]
+fn suggest_repeatable_delimiter_values_subcommand_alias() {
+    let mut cmd = Command::new("tool").subcommand(deploy_subcommand());
+
+    assert_data_eq!(
+        complete!(cmd, "d --tag [TAB]"),
+        snapbox::str![[r#"
+dev
+prod
+ci
+"#]]
+    );
+
+    assert_data_eq!(complete!(cmd, "d --tag d[TAB]"), snapbox::str!["dev"]);
+
+    assert_data_eq!(
+        complete!(cmd, "d --tag=de[TAB]"),
+        snapbox::str!["--tag=dev"]
+    );
+
+    assert_data_eq!(
+        complete!(cmd, "d --tag=dev,[TAB]"),
+        snapbox::str![[r#"
+--tag=dev,prod
+--tag=dev,ci
+"#]]
+    );
+
+    assert_data_eq!(
+        complete!(cmd, "d -tdev,[TAB]"),
+        snapbox::str![[r#"
+-tdev,prod
+-tdev,ci
+"#]]
+    );
+
+    assert_data_eq!(
+        complete!(cmd, "d --tag dev,prod --tag [TAB]"),
+        snapbox::str![[r#"
+dev
+prod
+ci
+"#]]
+    );
+
+    assert_data_eq!(complete!(cmd, "d --tag=dev,prod,[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(cmd, "d --tag=dev,,[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(cmd, "d --tag=staging,[TAB]"), snapbox::str![""]);
+
+    assert_data_eq!(
+        complete!(cmd, "d -- [TAB]"),
+        snapbox::str![[r#"
+all
+changed
+"#]]
+    );
+}
+
+#[test]
+fn suggest_repeatable_delimiter_values_multicall() {
+    fn multicall_command() -> Command {
+        Command::new("tool")
+            .multicall(true)
+            .subcommand(Command::new("tool").subcommand(deploy_subcommand()))
+            .subcommand(deploy_subcommand())
+    }
+
+    // Applet invoked directly, with a directory in argv0
+    let mut cmd = multicall_command();
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["/usr/bin/deploy", "--tag", ""]),
+        snapbox::str![[r#"
+dev
+prod
+ci
+"#]]
+    );
+
+    // Applet invoked directly, with an extension in argv0
+    let mut cmd = multicall_command();
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["deploy.exe", "--tag=dev,"]),
+        snapbox::str![[r#"
+--tag=dev,prod
+--tag=dev,ci
+"#]]
+    );
+
+    // Applet invoked directly, with a directory and an extension in argv0
+    let mut cmd = multicall_command();
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["/opt/tool/bin/deploy.exe", "--tag=de"]),
+        snapbox::str!["--tag=dev"]
+    );
+
+    // Aggregate applet, then the `deploy` applet
+    let mut cmd = multicall_command();
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["tool", "deploy", "--tag", ""]),
+        snapbox::str![[r#"
+dev
+prod
+ci
+"#]]
+    );
+
+    let mut cmd = multicall_command();
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["tool", "deploy", "--tag=dev,"]),
+        snapbox::str![[r#"
+--tag=dev,prod
+--tag=dev,ci
+"#]]
+    );
+
+    let mut cmd = multicall_command();
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["tool", "d", "-tdev,"]),
+        snapbox::str![[r#"
+-tdev,prod
+-tdev,ci
+"#]]
+    );
+
+    let mut cmd = multicall_command();
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["tool", "deploy", "--tag=dev,prod,"]),
+        snapbox::str![""]
+    );
+
+    // Unknown applet
+    let mut cmd = multicall_command();
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["unknown", "deploy", "--tag", ""]),
+        snapbox::str![""]
+    );
+}
+
+fn complete_multicall(cmd: &mut Command, args: &[&str]) -> String {
+    let args: Vec<std::ffi::OsString> = args.iter().map(std::ffi::OsString::from).collect();
+    let arg_index = args.len() - 1;
+    clap_complete::engine::complete(cmd, args, arg_index, None)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| {
+            let compl = candidate.get_value().to_str().unwrap();
+            if let Some(help) = candidate.get_help() {
+                format!("{compl}\t{help}")
+            } else {
+                compl.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 #[test]
 fn suggest_allow_hyphen() {
     let mut cmd = Command::new("exhaustive")
