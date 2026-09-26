@@ -40,6 +40,11 @@ pub fn complete(
     let mut current_cmd = &*cmd;
     let mut pos_index = 1;
     let mut is_escaped = false;
+    // Tracks whether the committed tokens resolve to a concrete command path.
+    // A committed token that is neither a subcommand (after `--`, subcommand
+    // selection is disabled) nor consumed by a positional makes the path
+    // unresolvable, so the completion point must produce no candidates.
+    let mut is_known_path = true;
     let mut next_state = ParseState::ValueDone;
     while let Some(arg) = raw_args.next(&mut cursor) {
         let current_state = next_state;
@@ -49,6 +54,10 @@ pub fn complete(
             arg.to_value_os(),
         );
         if cursor == target_cursor {
+            if !is_known_path {
+                debug!("complete: unresolvable command path, returning no candidates");
+                return Ok(Vec::new());
+            }
             return complete_arg(
                 &arg,
                 current_cmd,
@@ -60,14 +69,21 @@ pub fn complete(
         }
 
         if let Ok(value) = arg.to_value() {
-            if let Some(next_cmd) = current_cmd.find_subcommand(value) {
-                current_cmd = next_cmd;
-                pos_index = 1;
-                continue;
+            // A token after `--` is a positional value, never a subcommand,
+            // even if it spells the name or alias of one.
+            if !is_escaped {
+                if let Some(next_cmd) = current_cmd.find_subcommand(value) {
+                    current_cmd = next_cmd;
+                    pos_index = 1;
+                    continue;
+                }
             }
         }
 
         if is_escaped {
+            if !has_positional_at(current_cmd, pos_index) {
+                is_known_path = false;
+            }
             (next_state, pos_index) =
                 parse_positional(current_cmd, pos_index, is_escaped, current_state);
         } else if arg.is_escape() {
@@ -111,6 +127,18 @@ pub fn complete(
         } else {
             match current_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
+                    // At a subcommand-selection level, a committed bare token
+                    // that is neither a subcommand nor a value accepted by the
+                    // positional at the current index leaves the command path
+                    // unresolvable (unless external subcommands are allowed).
+                    // Leaf commands without subcommands keep their lenient
+                    // behavior of still offering flags at the completion point.
+                    if current_cmd.has_subcommands()
+                        && !has_positional_at(current_cmd, pos_index)
+                        && !current_cmd.is_allow_external_subcommands_set()
+                    {
+                        is_known_path = false;
+                    }
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
@@ -154,8 +182,12 @@ fn complete_arg(
 
     match state {
         ParseState::ValueDone => {
-            if let Ok(value) = arg.to_value() {
-                completions.extend(complete_subcommand(value, cmd));
+            // After `--`, subcommand selection is disabled: a token that
+            // spells a command name or alias is a positional value.
+            if !is_escaped {
+                if let Ok(value) = arg.to_value() {
+                    completions.extend(complete_subcommand(value, cmd));
+                }
             }
 
             if let Some(positional) = cmd
@@ -493,6 +525,19 @@ fn complete_subcommand(value: &str, cmd: &clap::Command) -> Vec<CompletionCandid
         }
     }
 
+    // Collapse the canonical name and its aliases (which share the same id)
+    // onto the canonical name. `subcommands` yields the canonical name first,
+    // so the first occurrence wins; this must happen before alphabetical
+    // sorting, otherwise an earlier-sorting alias would replace the canonical
+    // name. Aliases whose canonical name does not match the prefix are not
+    // present here and remain completable on their own, including hidden ones,
+    // whose visibility is settled by the caller.
+    let mut seen_ids = std::collections::HashSet::new();
+    scs.retain(|c| match c.get_id() {
+        Some(id) => seen_ids.insert(id.clone()),
+        None => true,
+    });
+
     scs.sort();
     scs.dedup();
     scs
@@ -721,6 +766,12 @@ fn pos_allows_hyphen(cmd: &clap::Command, pos_index: usize) -> bool {
         .find(|a| a.get_index() == Some(pos_index))
         .map(|p| p.is_allow_hyphen_values_set())
         .unwrap_or(false)
+}
+
+/// Whether `cmd` declares a positional that consumes a value at `pos_index`.
+fn has_positional_at(cmd: &clap::Command, pos_index: usize) -> bool {
+    cmd.get_positionals()
+        .any(|a| a.get_index() == Some(pos_index))
 }
 
 fn opt_allows_hyphen(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> bool {

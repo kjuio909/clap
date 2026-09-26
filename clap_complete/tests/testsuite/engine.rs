@@ -1453,6 +1453,162 @@ pos_b
 }
 
 #[test]
+fn suggest_alias_resolves_same_as_canonical_path() {
+    fn tool() -> Command {
+        Command::new("tool")
+            .disable_help_flag(true)
+            .disable_help_subcommand(true)
+            .subcommand(
+                Command::new("remote")
+                    .visible_alias("r")
+                    .disable_help_flag(true)
+                    .disable_help_subcommand(true)
+                    .subcommand(
+                        Command::new("add")
+                            .visible_alias("a")
+                            .disable_help_flag(true)
+                            .disable_help_subcommand(true)
+                            .arg(clap::Arg::new("mode").value_parser(["fast", "safe"])),
+                    ),
+            )
+            .subcommand(Command::new("status").disable_help_flag(true))
+    }
+
+    for input in ["remote add ", "r add ", "remote a ", "r a "] {
+        assert_data_eq!(
+            complete!(tool(), input),
+            snapbox::str![[r#"
+fast
+safe
+"#]],
+        );
+    }
+}
+
+#[test]
+fn suggest_canonical_subcommand_names_at_empty_prefix() {
+    let mut cmd = Command::new("tool")
+        .disable_help_flag(true)
+        .disable_help_subcommand(true)
+        .subcommand(
+            Command::new("remote")
+                .visible_alias("r")
+                .disable_help_flag(true)
+                .disable_help_subcommand(true),
+        )
+        .subcommand(Command::new("status").disable_help_flag(true));
+
+    // Visible aliases must not form their own branch: an empty prefix lists
+    // only the canonical names.
+    assert_data_eq!(complete!(cmd, " "), snapbox::str!["remote\nstatus"]);
+
+    // A committed alias descends into the canonical command's subtree.
+    assert_data_eq!(complete!(cmd, "r "), snapbox::str![""]);
+}
+
+#[test]
+fn suggest_alias_two_levels_no_root_candidates() {
+    let mut cmd = Command::new("tool")
+        .disable_help_flag(true)
+        .disable_help_subcommand(true)
+        .subcommand(
+            Command::new("remote")
+                .visible_alias("r")
+                .disable_help_flag(true)
+                .disable_help_subcommand(true)
+                .subcommand(
+                    Command::new("add")
+                        .visible_alias("a")
+                        .disable_help_flag(true)
+                        .disable_help_subcommand(true)
+                        .arg(clap::Arg::new("mode").value_parser(["fast", "safe"])),
+                ),
+        )
+        .subcommand(Command::new("status").disable_help_flag(true));
+
+    // Under an alias at each level, completion stays inside the subtree and
+    // never mixes in root candidates.
+    assert_data_eq!(complete!(cmd, "r a s"), snapbox::str!["safe"]);
+    assert_data_eq!(complete!(cmd, "r a "), snapbox::str!["fast\nsafe"]);
+    // The empty prefix under a committed alias lists the canonical name of
+    // the nested subcommand, not the alias.
+    assert_data_eq!(complete!(cmd, "r "), snapbox::str!["add"]);
+}
+
+#[test]
+fn suggest_alias_path_after_escape_stays_positional() {
+    fn tool() -> Command {
+        Command::new("tool")
+            .disable_help_flag(true)
+            .disable_help_subcommand(true)
+            .subcommand(
+                Command::new("remote")
+                    .visible_alias("r")
+                    .disable_help_flag(true)
+                    .disable_help_subcommand(true)
+                    .subcommand(
+                        Command::new("add")
+                            .visible_alias("a")
+                            .disable_help_flag(true)
+                            .disable_help_subcommand(true)
+                            .arg(clap::Arg::new("mode").value_parser(["fast", "safe"])),
+                    ),
+            )
+    }
+
+    // After `--`, only positional values are completed; tokens naming
+    // subcommands or aliases do not re-enter subcommand selection.
+    assert_data_eq!(
+        complete!(tool(), "r a -- "),
+        snapbox::str![[r#"
+fast
+safe
+"#]]
+    );
+    assert_data_eq!(complete!(tool(), "r a -- a"), snapbox::str![""]);
+    assert_data_eq!(complete!(tool(), "r a -- remote"), snapbox::str![""]);
+    // A value outside the possible set yields no candidate either.
+    assert_data_eq!(complete!(tool(), "r a -- fast "), snapbox::str![""]);
+}
+
+#[test]
+fn suggest_unknown_alias_or_command_is_empty() {
+    fn tool() -> Command {
+        Command::new("tool")
+            .disable_help_flag(true)
+            .disable_help_subcommand(true)
+            .subcommand(
+                Command::new("remote")
+                    .visible_alias("r")
+                    .disable_help_flag(true)
+                    .disable_help_subcommand(true)
+                    .subcommand(
+                        Command::new("add")
+                            .visible_alias("a")
+                            .disable_help_flag(true)
+                            .disable_help_subcommand(true)
+                            .arg(clap::Arg::new("mode").value_parser(["fast", "safe"])),
+                    ),
+            )
+            .subcommand(Command::new("status").disable_help_flag(true))
+    }
+
+    // Aliases resolve on full tokens only: partial spellings are unknown
+    // committed names and produce no candidates (no root fallback).
+    for input in ["re add ", "re a ", "ra ", "x a "] {
+        assert_data_eq!(complete!(tool(), input), snapbox::str![""]);
+    }
+    // Unknown invocation names and unknown subtrees are empty as well.
+    for input in ["bogus ", "r a bogus "] {
+        assert_data_eq!(complete!(tool(), input), snapbox::str![""]);
+    }
+
+    // At the completion point a typed prefix still completes to the canonical
+    // name rather than resolving the alias partially.
+    assert_data_eq!(complete!(tool(), "r[TAB]"), snapbox::str!["remote"]);
+}
+
+#[test]
 fn suggest_external_subcommand() {
     let mut cmd = Command::new("dynamic")
         .allow_external_subcommands(true)
