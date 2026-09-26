@@ -1631,6 +1631,236 @@ fn suggest_conflicting_args() {
 }
 
 #[test]
+fn suggest_conflicting_short_flags() {
+    // The short spellings must produce exactly the same conflict results as
+    // the long ones: `-f/--fast` conflicts with `-s/--safe`, `-t/--tag` takes
+    // a value and conflicts with `fast`.
+    fn command() -> Command {
+        Command::new("exhaustive")
+            .arg(
+                clap::Arg::new("fast")
+                    .long("fast")
+                    .short('f')
+                    .visible_alias("quick")
+                    .alias("speedy")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("safe"),
+            )
+            .arg(
+                clap::Arg::new("safe")
+                    .long("safe")
+                    .short('s')
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                clap::Arg::new("tag")
+                    .long("tag")
+                    .short('t')
+                    .value_parser(["v1", "v2"])
+                    .conflicts_with("fast"),
+            )
+    }
+
+    // `tag` given as a separate value word hides `fast` (long, short and
+    // aliases) while keeping `tag` itself and `help`.
+    assert_data_eq!(
+        complete!(command(), "-t v1 [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // The attached value form has the identical result.
+    assert_data_eq!(
+        complete!(command(), "-tv1 [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-t=v1 [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // Parity with the long spellings, both separate and attached.
+    assert_data_eq!(
+        complete!(command(), "--tag v1 [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "--tag=v1 [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // `fast` hides `safe`, `tag` and itself stays.
+    assert_data_eq!(
+        complete!(command(), "-f [TAB]"),
+        snapbox::str![[r#"
+--fast
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-s [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // Short candidates are suppressed as thoroughly as long ones.
+    assert_data_eq!(
+        complete!(command(), "-t v1 -[TAB]"),
+        snapbox::str![[r#"
+-s	--safe
+-t	--tag
+-h	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-t v1 -f[TAB]"),
+        snapbox::str![[r#"
+-fs	--safe
+-ft	--tag
+-fh	Print help
+"#]],
+    );
+
+    // Visible and hidden aliases of a suppressed argument vanish too.
+    assert_data_eq!(complete!(command(), "-t v1 --q[TAB]"), snapbox::str![""]);
+    assert_data_eq!(
+        complete!(command(), "-t v1 --spe[TAB]"),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(command(), "-t v1 --s[TAB]"),
+        snapbox::str!["--safe"]
+    );
+
+    // While the value is still being edited, only the option's own values are
+    // offered; conflict results from following options are not applied early.
+    assert_data_eq!(
+        complete!(command(), "-t [TAB]"),
+        snapbox::str![[r#"
+v1
+v2
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-tv[TAB]"),
+        snapbox::str![[r#"
+-tv1
+-tv2
+"#]],
+    );
+
+    // Every member of a legal cluster participates in conflict resolution:
+    // `s` is recorded alongside the value-taking `t`, and `t` still hides
+    // `fast`.
+    assert_data_eq!(
+        complete!(command(), "-st v1 [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-stv1 [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // `f` before the value-taking `t` is recorded as well, so `safe` is hidden
+    // by the time the attached value closes the word.
+    assert_data_eq!(
+        complete!(command(), "-ftv1 [TAB]"),
+        snapbox::str![[r#"
+--fast
+--tag
+--help	Print help
+"#]],
+    );
+
+    // Invalid short strings keep the existing completion semantics: their
+    // recognized members are not guessed out of the cluster and therefore do
+    // not suppress anything.
+    assert_data_eq!(
+        complete!(command(), "-fx [TAB]"),
+        snapbox::str![[r#"
+--fast
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-xt v1 [TAB]"),
+        snapbox::str![[r#"
+--fast
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // After `--` only positionals are completed (none here); state parsed from
+    // the preceding short options stays valid.
+    assert_data_eq!(complete!(command(), "-f -- [TAB]"), snapbox::str![""]);
+}
+
+#[test]
+fn complete_no_binary_name_short_records_state() {
+    fn command() -> Command {
+        Command::new("exhaustive")
+            .no_binary_name(true)
+            .arg(
+                clap::Arg::new("fast")
+                    .long("fast")
+                    .short('f')
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                clap::Arg::new("tag")
+                    .long("tag")
+                    .short('t')
+                    .value_parser(["v1", "v2"])
+                    .conflicts_with("fast"),
+            )
+    }
+
+    // With `no_binary_name`, the first word is parsed as an option.
+    let mut cmd = command();
+    let completions =
+        clap_complete::engine::complete(&mut cmd, vec!["-t".into(), "v1".into(), "".into()], 2, None)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.get_value().to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+    assert_eq!(completions, vec!["--tag", "--help"]);
+}
+
+#[test]
 fn suggest_conflicts_declared_on_absent_arg() {
     // The conflict is declared by `safe`, yet completing after `--fast` must
     // still hide `--safe`: conflicts are evaluated bidirectionally.

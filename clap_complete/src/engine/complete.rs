@@ -109,14 +109,22 @@ pub fn complete(
                 }
             }
         } else if let Some(short) = arg.to_short() {
-            let (leading_flags, takes_value_opt, mut short) = parse_shortflags(current_cmd, short);
-            // Every recognized flag in the cluster was explicitly supplied.
-            for flag in leading_flags.chars() {
-                if let Some(opt) = current_cmd.get_arguments().find(|a| {
-                    a.get_short_and_visible_aliases()
-                        .is_some_and(|shorts| shorts.contains(&flag))
-                }) {
-                    explicit_opts.insert(opt.get_id().clone());
+            let (leading_flags, takes_value_opt, mut short, cluster_valid) =
+                parse_shortflags(current_cmd, short);
+            // Only a cluster made entirely of recognized flags records state.
+            // Splitting an invalid short string into known and unknown members
+            // would be guesswork and could suppress conflicting candidates, so
+            // invalid clusters keep the existing completion behavior; clap's
+            // parser would reject them anyway.
+            if cluster_valid {
+                // Every recognized flag in the cluster was explicitly supplied.
+                for flag in leading_flags.chars() {
+                    if let Some(opt) = current_cmd.get_arguments().find(|a| {
+                        a.get_short_and_visible_aliases()
+                            .is_some_and(|shorts| shorts.contains(&flag))
+                    }) {
+                        explicit_opts.insert(opt.get_id().clone());
+                    }
                 }
             }
             if let Some(opt) = takes_value_opt {
@@ -342,7 +350,7 @@ fn complete_option(
     } else if let Some(short) = arg.to_short() {
         if !short.is_negative_number() {
             // Find the first takes_values option.
-            let (leading_flags, takes_value_opt, mut short) = parse_shortflags(cmd, short);
+            let (leading_flags, takes_value_opt, mut short, _) = parse_shortflags(cmd, short);
 
             // Clone `short` to `peek_short` to peek whether the next flag is a `=`.
             if let Some(opt) = takes_value_opt {
@@ -660,18 +668,29 @@ fn populate_command_candidate(
 }
 
 /// Parse the short flags and find the first `takes_values` option.
+///
+/// The returned bool is `true` only when every scanned cluster member was a
+/// recognized option. Anything after the first value-taking option is the
+/// option's value and therefore not scanned; invalid UTF-8 and unknown short
+/// characters make the result `false`.
 fn parse_shortflags<'c, 's>(
     cmd: &'c clap::Command,
     mut short: clap_lex::ShortFlags<'s>,
-) -> (String, Option<&'c clap::Arg>, clap_lex::ShortFlags<'s>) {
+) -> (
+    String,
+    Option<&'c clap::Arg>,
+    clap_lex::ShortFlags<'s>,
+    bool,
+) {
     let takes_value_opt;
     let mut leading_flags = String::new();
+    let mut cluster_valid = true;
     // Find the first takes_values option.
     loop {
         match short.next_flag() {
             Some(Ok(opt)) => {
                 leading_flags.push(opt);
-                let opt = cmd.get_arguments().find(|a| {
+                let found = cmd.get_arguments().find(|a| {
                     let shorts = a.get_short_and_visible_aliases();
                     let is_find = shorts.map(|v| {
                         let mut iter = v.into_iter();
@@ -680,22 +699,28 @@ fn parse_shortflags<'c, 's>(
                     });
                     is_find.unwrap_or(false)
                 });
-                if opt
-                    .map(|o| o.get_num_args().expect("built").takes_values())
-                    .unwrap_or(false)
-                {
-                    takes_value_opt = opt;
-                    break;
+                if let Some(opt) = found {
+                    if opt.get_num_args().expect("built").takes_values() {
+                        takes_value_opt = Some(opt);
+                        break;
+                    }
+                } else {
+                    cluster_valid = false;
                 }
             }
-            Some(Err(_)) | None => {
+            Some(Err(_)) => {
+                cluster_valid = false;
+                takes_value_opt = None;
+                break;
+            }
+            None => {
                 takes_value_opt = None;
                 break;
             }
         }
     }
 
-    (leading_flags, takes_value_opt, short)
+    (leading_flags, takes_value_opt, short, cluster_valid)
 }
 
 /// Parse the positional arguments. Return the new state and the new positional index.
