@@ -182,6 +182,21 @@ fn complete_arg(
 
     match state {
         ParseState::ValueDone => {
+            // A closed `--name=value` word (or a short cluster carrying an
+            // inline value, e.g. `-ovalue` / `-o=value`) is the option's value
+            // position: only the option's own values are completed, exactly as
+            // if the value had been written as a separate word.  The content
+            // after `=` never takes part in subcommand, positional or
+            // option-name completion, and the word itself is not yet part of
+            // the conflict set.
+            if !is_escaped {
+                if let Some(values) = complete_inline_option_value(arg, cmd, current_dir, disabled)
+                {
+                    completions.extend(values);
+                    return finalize_completions(completions);
+                }
+            }
+
             // After `--`, only positional arguments are completed.
             if !is_escaped {
                 if let Ok(value) = arg.to_value() {
@@ -252,6 +267,15 @@ fn complete_arg(
             }
         }
     }
+
+    finalize_completions(completions)
+}
+
+/// Hide hidden candidates when visible ones exist, deduplicate by id and sort
+/// into the presentation order shared by every completion source.
+fn finalize_completions(
+    mut completions: Vec<CompletionCandidate>,
+) -> Result<Vec<CompletionCandidate>, std::io::Error> {
     if completions.iter().any(|a| !a.is_hide_set()) {
         completions.retain(|a| !a.is_hide_set());
     }
@@ -279,6 +303,82 @@ fn complete_arg(
     });
 
     Ok(completions)
+}
+
+/// Complete the inline value carried by the cursor's option word.
+///
+/// This covers `--name=value` as well as short clusters with an attached
+/// value, e.g. `-ovalue` and `-o=value` (including leading flags, `-abovalue`).
+/// It returns the option's value candidates, re-prefixed with the exact
+/// option spelling, when the cursor is inside such a value.  The whole word is
+/// consumed by its option: nothing after `=` or past the taking flag takes
+/// part in option-name, subcommand or positional completion, and the word is
+/// not yet part of the conflict set.
+///
+/// A bare `--name`/`-o` whose value is still a separate word completes
+/// normally, as does an unknown long name, a recognized option that takes no
+/// value and anything else that cannot be recognized: `None` preserves the
+/// existing failure semantics rather than guessing a split.
+fn complete_inline_option_value(
+    arg: &clap_lex::ParsedArg<'_>,
+    cmd: &clap::Command,
+    current_dir: Option<&std::path::Path>,
+    disabled: &HashSet<Id>,
+) -> Option<Vec<CompletionCandidate>> {
+    if let Some((flag, value)) = arg.to_long() {
+        let flag = flag.ok()?;
+        // A bare `--name` has no attached value and is completed as an option name.
+        let value = value?;
+        let opt = cmd.get_arguments().find(|a| {
+            a.get_long_and_visible_aliases()
+                .is_some_and(|longs| longs.into_iter().any(|long| long == flag))
+        })?;
+        if !opt.get_num_args().expect("built").takes_values() {
+            return None;
+        }
+        if disabled.contains(opt.get_id()) {
+            return Some(Vec::new());
+        }
+        return Some(
+            complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0)
+                .into_iter()
+                .map(|comp| comp.add_prefix(format!("--{flag}=")))
+                .collect(),
+        );
+    }
+
+    let short = arg.to_short()?;
+    if short.is_negative_number() {
+        return None;
+    }
+    let (leading_flags, opt, mut value_flags, _) = parse_shortflags(cmd, short);
+    let opt = opt?;
+
+    // Detect an attached value: once the cluster reaches its value-taking
+    // flag, everything left is the value, optionally introduced by `=`.  With
+    // no remainder and no `=` (`-o`), the word is left to the regular option
+    // completion, which already offers inline values.
+    let mut peek = value_flags.clone();
+    let has_equal = matches!(peek.next_flag(), Some(Ok('=')));
+    if !has_equal && value_flags.is_empty() {
+        return None;
+    }
+    if has_equal {
+        // Consume the `=` so the remainder is the bare value (possibly empty
+        // for `-o=`), matching the space-separated empty-value position.
+        value_flags.next_flag();
+    }
+    if disabled.contains(opt.get_id()) {
+        return Some(Vec::new());
+    }
+    let value = value_flags.next_value_os().unwrap_or(OsStr::new(""));
+    let sep = if has_equal { "=" } else { "" };
+    Some(
+        complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0)
+            .into_iter()
+            .map(|comp| comp.add_prefix(format!("-{leading_flags}{sep}")))
+            .collect(),
+    )
 }
 
 fn complete_option(

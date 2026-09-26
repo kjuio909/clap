@@ -1213,9 +1213,6 @@ comma,tab
     assert_data_eq!(
         complete!(cmd, "--delimiter=comma,[TAB]"),
         snapbox::str![[r#"
---delimiter=comma,a_pos
---delimiter=comma,b_pos
---delimiter=comma,c_pos
 --delimiter=comma,comma
 --delimiter=comma,space
 --delimiter=comma,tab
@@ -1266,9 +1263,6 @@ comma,tab
     assert_data_eq!(
         complete!(cmd, "-D=comma,[TAB]"),
         snapbox::str![[r#"
--D=comma,a_pos
--D=comma,b_pos
--D=comma,c_pos
 -D=comma,comma
 -D=comma,space
 -D=comma,tab
@@ -2117,6 +2111,159 @@ fn complete_without_word_is_error() {
     )
     .unwrap_err();
     assert_eq!(err.to_string(), "no completion generated");
+}
+
+#[test]
+fn suggest_long_equals_value_position() {
+    // A `--name=value` word at the cursor is the option's value position:
+    // only the option's own values are offered, exactly as if the value had
+    // been written as a separate word.  Nothing past `=` is completed as an
+    // option name, subcommand or positional.
+    let mut cmd = Command::new("exhaustive")
+        .arg(clap::Arg::new("tag").long("tag").value_parser(["red", "blue"]))
+        .arg(clap::Arg::new("pos").value_parser(["pos-a", "pos-b"]))
+        .subcommand(Command::new("sub"));
+
+    assert_data_eq!(
+        complete!(cmd, "--tag=[TAB]"),
+        snapbox::str![[r#"
+--tag=red
+--tag=blue
+"#]]
+    );
+    assert_data_eq!(complete!(cmd, "--tag=r[TAB]"), snapbox::str!["--tag=red"]);
+
+    // A closed attached value ends the option's values; the next word is a
+    // fresh position again.
+    assert_data_eq!(
+        complete!(cmd, "--tag=red [TAB]"),
+        snapbox::str![[r#"
+sub
+help	Print this message or the help of the given subcommand(s)
+pos-a
+pos-b
+--tag
+--help	Print help
+"#]]
+    );
+
+    // The state established through `=` survives `--`; only positionals are
+    // completed afterwards.
+    assert_data_eq!(
+        complete!(cmd, "--tag=red -- [TAB]"),
+        snapbox::str![[r#"
+pos-a
+pos-b
+"#]]
+    );
+}
+
+#[test]
+fn suggest_long_equals_multi_values() {
+    // For an option taking multiple values, every segment after `=` belongs
+    // to that option until its value rule ends.
+    let mut cmd = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("nums")
+                .long("nums")
+                .num_args(1..=3)
+                .value_parser(["one", "two", "three"]),
+        )
+        .arg(clap::Arg::new("pos").value_parser(["pos-a"]));
+
+    assert_data_eq!(
+        complete!(cmd, "--nums=[TAB]"),
+        snapbox::str![[r#"
+--nums=one
+--nums=two
+--nums=three
+"#]]
+    );
+    assert_data_eq!(complete!(cmd, "--nums=o[TAB]"), snapbox::str!["--nums=one"]);
+
+    // An attached value closes the occurrence, mirroring `--nums one`.
+    assert_data_eq!(
+        complete!(cmd, "--nums=one [TAB]"),
+        snapbox::str![[r#"
+pos-a
+--nums
+--help	Print help
+"#]]
+    );
+}
+
+#[test]
+fn suggest_long_equals_failure_semantics() {
+    // Unknown long names, flags that take no value and unparseable words keep
+    // the existing failure semantics instead of guessing a split.
+    let mut cmd = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .value_parser(["v1", "v2"])
+                .conflicts_with("fast"),
+        );
+
+    assert_data_eq!(complete!(cmd, "--nope=[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(cmd, "--fast=[TAB]"), snapbox::str![""]);
+
+    // A closed `--fast=x` word keeps the existing behavior of recording
+    // `fast`, so the conflicting `tag` stays suppressed.
+    assert_data_eq!(
+        complete!(cmd, "--fast=x [TAB]"),
+        snapbox::str![[r#"
+--fast
+--help	Print help
+"#]]
+    );
+
+    // The word being edited is not part of the conflict set yet, but
+    // conflicts from earlier words still apply: a prior `--fast` disables
+    // `tag`, so its value candidates are suppressed.
+    assert_data_eq!(complete!(cmd, "--fast --tag=[TAB]"), snapbox::str![""]);
+
+    // Without the conflicting `--fast`, the editing word itself does not
+    // disable anything: `tag`'s own values are offered while `--tag=` is
+    // being typed.
+    assert_data_eq!(
+        complete!(cmd, "--tag=[TAB]"),
+        snapbox::str![[r#"
+--tag=v1
+--tag=v2
+"#]]
+    );
+}
+
+#[test]
+fn complete_no_binary_name_equals_records_state() {
+    let mut cmd = Command::new("exhaustive")
+        .no_binary_name(true)
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .value_parser(["v1", "v2"])
+                .conflicts_with("fast"),
+        )
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .action(clap::ArgAction::SetTrue),
+        );
+
+    // With `no_binary_name`, a first word of `--tag=v1` records `tag` as
+    // present and hides the conflicting `fast`.
+    let completions =
+        clap_complete::engine::complete(&mut cmd, vec!["--tag=v1".into(), "".into()], 1, None)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.get_value().to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+    assert_eq!(completions, vec!["--tag", "--help"]);
 }
 
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
