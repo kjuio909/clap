@@ -2063,6 +2063,88 @@ fn suggest_long_equals_visible_alias_values() {
 }
 
 #[test]
+fn suggest_flag_with_equals_records_no_state() {
+    // An attached `=value` on an option that takes no values is rejected by
+    // clap's parser. The completion engine keeps the existing failure
+    // semantics: the malformed word is not treated as the option being
+    // present, so none of its conflicts are suppressed.
+    let mut cmd = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("safe")
+                .long("safe")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("fast"),
+        );
+
+    assert_data_eq!(
+        complete!(cmd, "--fast=x [TAB]"),
+        snapbox::str![[r#"
+--fast
+--safe
+--help	Print help
+"#]],
+    );
+
+    // The valid closed forms still record the option and hide its conflicts.
+    assert_data_eq!(
+        complete!(cmd, "--fast [TAB]"),
+        snapbox::str![[r#"
+--fast
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
+fn suggest_equals_state_survives_escape() {
+    // State established by a closed `--name=value` stays valid across `--`;
+    // afterwards only positional arguments are completed.
+    let mut cmd = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("positional").value_parser(["pos-a", "pos-b", "pos-c"]),
+        )
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .value_parser(["v1", "v2"])
+                .conflicts_with("fast"),
+        );
+
+    assert_data_eq!(
+        complete!(cmd, "--tag=v1 -- [TAB]"),
+        snapbox::str![[r#"
+pos-a
+pos-b
+pos-c
+"#]],
+    );
+
+    // The attached value is not re-scanned as an option or positional word:
+    // `pos-a` only counts as `tag`'s value, so the first positional is still
+    // open and `fast` stays hidden by the conflict.
+    assert_data_eq!(
+        complete!(cmd, "--tag=pos-a [TAB]"),
+        snapbox::str![[r#"
+pos-a
+pos-b
+pos-c
+--tag
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
 fn complete_no_binary_name_keeps_first_arg() {
     fn command() -> Command {
         Command::new("exhaustive")

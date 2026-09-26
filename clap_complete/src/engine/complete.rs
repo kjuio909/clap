@@ -99,8 +99,15 @@ pub fn complete(
                 });
 
                 if let Some(opt) = opt {
-                    explicit_opts.insert(opt.get_id().clone());
-                    if opt.get_num_args().expect("built").takes_values() && value.is_none() {
+                    let takes_values = opt.get_num_args().expect("built").takes_values();
+                    // An attached `=value` on an option that takes no values is
+                    // rejected by clap's parser; keep the existing failure
+                    // semantics instead of guessing a successful parse state
+                    // that would suppress conflicting candidates.
+                    if takes_values || value.is_none() {
+                        explicit_opts.insert(opt.get_id().clone());
+                    }
+                    if takes_values && value.is_none() {
                         next_state = ParseState::Opt((opt, 1));
                     };
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
