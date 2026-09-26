@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Fixes
+
+- *(dynamic)* Resolve subcommand aliases as command paths so candidates match the canonical path, list canonical subcommand names in empty-prefix completions, and return no candidates for unknown command paths
+
 ## [4.6.10] - 2026-09-14
 
 ## [4.6.9] - 2026-08-06

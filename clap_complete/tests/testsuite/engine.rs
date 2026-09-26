@@ -1531,6 +1531,106 @@ pos-c
     );
 }
 
+#[test]
+fn suggest_subcommand_aliases_as_paths() {
+    fn tool() -> Command {
+        Command::new("tool")
+            .subcommand(
+                Command::new("remote")
+                    .visible_alias("r")
+                    .subcommand(
+                        Command::new("add")
+                            .visible_alias("a")
+                            .arg(clap::Arg::new("mode").value_parser(["fast", "safe"])),
+                    ),
+            )
+            .subcommand(Command::new("status"))
+    }
+
+    // Every spelling of the command path produces the same candidates for
+    // `mode`: no duplicates, no reordering, no root-level commands mixed in.
+    let canonical = "fast\nsafe\n--help\tPrint help";
+    assert_eq!(complete!(tool(), "remote add [TAB]"), canonical);
+    assert_eq!(complete!(tool(), "r add [TAB]"), canonical);
+    assert_eq!(complete!(tool(), "remote a [TAB]"), canonical);
+    assert_eq!(complete!(tool(), "r a [TAB]"), canonical);
+
+    // A typed prefix still matches the command, independent of the path taken.
+    assert_data_eq!(
+        complete!(tool(), "r a f[TAB]"),
+        snapbox::str!["fast"]
+    );
+
+    // After `--` only the positional's values are offered, never subcommands.
+    assert_data_eq!(
+        complete!(tool(), "remote add -- [TAB]"),
+        snapbox::str![[r#"
+fast
+safe
+"#]]
+    );
+    assert_data_eq!(
+        complete!(tool(), "r a -- [TAB]"),
+        snapbox::str![[r#"
+fast
+safe
+"#]]
+    );
+
+    // Empty prefixes list canonical names only; visible aliases don't form
+    // branches of their own.
+    assert_data_eq!(
+        complete!(tool(), " [TAB]"),
+        snapbox::str![[r#"
+remote
+status
+help	Print this message or the help of the given subcommand(s)
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(tool(), "remote [TAB]"),
+        snapbox::str![[r#"
+add
+help	Print this message or the help of the given subcommand(s)
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(tool(), "r [TAB]"),
+        snapbox::str![[r#"
+add
+help	Print this message or the help of the given subcommand(s)
+--help	Print help
+"#]]
+    );
+
+    // Completing a prefix of the canonical name or an alias offers the
+    // canonical name.
+    assert_data_eq!(complete!(tool(), "rem[TAB]"), snapbox::str!["remote"]);
+    assert_data_eq!(complete!(tool(), "r[TAB]"), snapbox::str!["remote"]);
+    assert_data_eq!(
+        complete!(tool(), "remote a[TAB]"),
+        snapbox::str!["add"]
+    );
+
+    // Aliases match whole tokens only: a partial token is not a path into the
+    // command, so candidates come from an unknown command and are empty.
+    assert_data_eq!(complete!(tool(), "rem add [TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(tool(), "remote ad [TAB]"), snapbox::str![""]);
+
+    // Unknown command names return empty candidates.
+    assert_data_eq!(complete!(tool(), "bogus [TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(tool(), "remote bogus [TAB]"), snapbox::str![""]);
+
+    // A value after the (single) positional is consumed as its value rather
+    // than treated as a command, leaving options to complete.
+    assert_data_eq!(
+        complete!(tool(), "remote add bogus [TAB]"),
+        snapbox::str!["--help\tPrint help"]
+    );
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];

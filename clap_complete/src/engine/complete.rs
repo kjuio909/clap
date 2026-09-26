@@ -41,6 +41,9 @@ pub fn complete(
     let mut pos_index = 1;
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
+    // Set when a token matches neither a subcommand (by name or alias) nor a
+    // positional; everything after it belongs to an unknown invocation.
+    let mut unknown_subcommand = false;
     while let Some(arg) = raw_args.next(&mut cursor) {
         let current_state = next_state;
         next_state = ParseState::ValueDone;
@@ -49,6 +52,9 @@ pub fn complete(
             arg.to_value_os(),
         );
         if cursor == target_cursor {
+            if unknown_subcommand {
+                return Ok(Vec::new());
+            }
             return complete_arg(
                 &arg,
                 current_cmd,
@@ -57,14 +63,6 @@ pub fn complete(
                 is_escaped,
                 current_state,
             );
-        }
-
-        if let Ok(value) = arg.to_value() {
-            if let Some(next_cmd) = current_cmd.find_subcommand(value) {
-                current_cmd = next_cmd;
-                pos_index = 1;
-                continue;
-            }
         }
 
         if is_escaped {
@@ -110,7 +108,31 @@ pub fn complete(
             }
         } else {
             match current_state {
-                ParseState::ValueDone | ParseState::Pos(..) => {
+                ParseState::ValueDone => {
+                    if let Ok(value) = arg.to_value() {
+                        // Match the subcommand by its canonical name or any of
+                        // its aliases; aliases are full tokens, so prefixes are
+                        // only accepted as partial input for completion.
+                        if let Some(next_cmd) = current_cmd.find_subcommand(value) {
+                            current_cmd = next_cmd;
+                            pos_index = 1;
+                            continue;
+                        }
+                    }
+
+                    let has_positional = current_cmd
+                        .get_positionals()
+                        .any(|p| p.get_index() == Some(pos_index));
+                    (next_state, pos_index) =
+                        parse_positional(current_cmd, pos_index, is_escaped, current_state);
+                    // The token consumed neither a subcommand nor a positional.
+                    // In a normal command tree the invocation uses an unknown
+                    // command name; external subcommands accept any name.
+                    if !has_positional && !current_cmd.is_allow_external_subcommands_set() {
+                        unknown_subcommand = true;
+                    }
+                }
+                ParseState::Pos(..) => {
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
@@ -482,7 +504,17 @@ fn complete_subcommand(value: &str, cmd: &clap::Command) -> Vec<CompletionCandid
     let mut scs: Vec<CompletionCandidate> = subcommands(cmd)
         .into_iter()
         .filter(|x| x.get_value().starts_with(value))
-        .collect();
+        .fold(Vec::new(), |mut scs, candidate| {
+            // Candidates carry the id `command::<canonical name>`; keep the
+            // first one for each command. `subcommands` emits the canonical
+            // name first, so an alias is only used when the canonical name
+            // does not match the typed prefix.
+            let id = candidate.get_id();
+            if !scs.iter().any(|existing| existing.get_id() == id) {
+                scs.push(candidate);
+            }
+            scs
+        });
     if cmd.is_allow_external_subcommands_set() {
         let external_completer = cmd.get::<SubcommandCandidates>();
         if let Some(completer) = external_completer {
