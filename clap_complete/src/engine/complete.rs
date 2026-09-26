@@ -32,12 +32,25 @@ pub fn complete(
     raw_args.next_os(&mut target_cursor);
     debug!("complete: target_cursor={target_cursor:?}");
 
-    // TODO: Multicall support
-    if !cmd.is_no_binary_name_set() {
+    let mut current_cmd = &*cmd;
+    if cmd.is_multicall_set() {
+        // A multicall binary dispatches on argv0: the file stem of argv0 names
+        // the applet being run, so complete as if that applet was the root command.
+        if let Some(argv0) = raw_args.next_os(&mut cursor) {
+            let applet = std::path::Path::new(argv0)
+                .file_stem()
+                .and_then(|f| f.to_str());
+            let Some(applet) = applet.and_then(|name| cmd.find_subcommand(name)) else {
+                // argv0 doesn't name a known applet, so no parse can succeed
+                // and known applets must not leak into this invocation.
+                return Ok(Vec::new());
+            };
+            current_cmd = applet;
+        }
+    } else if !cmd.is_no_binary_name_set() {
         raw_args.next_os(&mut cursor);
     }
 
-    let mut current_cmd = &*cmd;
     let mut pos_index = 1;
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
@@ -68,6 +81,15 @@ pub fn complete(
         }
 
         if is_escaped {
+            if !current_cmd
+                .get_positionals()
+                .any(|p| p.get_index() == Some(pos_index))
+            {
+                // Everything after `--` is a positional value; when no positional
+                // argument can accept it, no parse can succeed and there is
+                // nothing to complete.
+                return Ok(Vec::new());
+            }
             (next_state, pos_index) =
                 parse_positional(current_cmd, pos_index, is_escaped, current_state);
         } else if arg.is_escape() {
@@ -111,6 +133,16 @@ pub fn complete(
         } else {
             match current_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
+                    if !current_cmd.is_allow_external_subcommands_set()
+                        && !current_cmd
+                            .get_positionals()
+                            .any(|p| p.get_index() == Some(pos_index))
+                    {
+                        // The token is neither a known subcommand nor a value for a
+                        // positional argument, so no parse can succeed and there is
+                        // nothing to complete.
+                        return Ok(Vec::new());
+                    }
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
@@ -483,6 +515,14 @@ fn complete_subcommand(value: &str, cmd: &clap::Command) -> Vec<CompletionCandid
         .into_iter()
         .filter(|x| x.get_value().starts_with(value))
         .collect();
+    // `subcommands` yields a command's name before its aliases; drop duplicates
+    // so the canonical name is what gets completed.
+    let mut seen_ids = std::collections::HashSet::new();
+    scs.retain(|c| {
+        c.get_id()
+            .map(|id| seen_ids.insert(id.to_owned()))
+            .unwrap_or(true)
+    });
     if cmd.is_allow_external_subcommands_set() {
         let external_completer = cmd.get::<SubcommandCandidates>();
         if let Some(completer) = external_completer {

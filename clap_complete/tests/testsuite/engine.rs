@@ -1531,6 +1531,146 @@ pos-c
     );
 }
 
+#[test]
+fn suggest_subcommand_alias_path() {
+    let mut cmd = Command::new("tool")
+        .disable_help_flag(true)
+        .disable_help_subcommand(true)
+        .subcommand(
+            Command::new("remote").visible_alias("r").subcommand(
+                Command::new("show")
+                    .visible_alias("s")
+                    .arg(
+                        clap::Arg::new("format")
+                            .long("format")
+                            .value_parser(["json", "yaml"]),
+                    )
+                    .arg(clap::Arg::new("target").value_parser(["all", "changed"])),
+            ),
+        )
+        .subcommand(Command::new("status"));
+
+    for input in [
+        "remote show --format [TAB]",
+        "r show --format [TAB]",
+        "remote s --format [TAB]",
+        "r s --format [TAB]",
+    ] {
+        assert_data_eq!(
+            complete!(cmd, input),
+            snapbox::str![[r#"
+json
+yaml
+"#]],
+        );
+    }
+
+    assert_data_eq!(
+        complete!(cmd, "remote show --format j[TAB]"),
+        snapbox::str!["json"]
+    );
+    assert_data_eq!(complete!(cmd, "r s --format j[TAB]"), snapbox::str!["json"]);
+
+    for input in [
+        "remote show -- [TAB]",
+        "r show -- [TAB]",
+        "remote s -- [TAB]",
+        "r s -- [TAB]",
+    ] {
+        assert_data_eq!(
+            complete!(cmd, input),
+            snapbox::str![[r#"
+all
+changed
+"#]],
+        );
+    }
+
+    assert_data_eq!(
+        complete!(cmd, " [TAB]"),
+        snapbox::str![[r#"
+remote
+status
+"#]],
+    );
+
+    assert_data_eq!(complete!(cmd, "unknown [TAB]"), snapbox::str![]);
+    assert_data_eq!(complete!(cmd, "remot show --format [TAB]"), snapbox::str![]);
+    assert_data_eq!(complete!(cmd, "remote show --format x[TAB]"), snapbox::str![]);
+}
+
+#[test]
+fn suggest_multicall() {
+    fn applet_commands() -> [Command; 2] {
+        [
+            Command::new("true").visible_alias("t").arg(
+                clap::Arg::new("state")
+                    .required(false)
+                    .value_parser(["on", "off"]),
+            ),
+            Command::new("false"),
+        ]
+    }
+
+    let mut cmd = Command::new("busybox")
+        .multicall(true)
+        .subcommand(
+            Command::new("busybox")
+                .subcommand_required(true)
+                .subcommands(applet_commands()),
+        )
+        .subcommands(applet_commands());
+
+    assert_data_eq!(
+        complete_multicall(&mut cmd, "/usr/bin/true", "-- ", 2),
+        snapbox::str![[r#"
+on
+off
+"#]],
+    );
+    assert_data_eq!(
+        complete_multicall(&mut cmd, "/usr/bin/busybox", "true -- ", 3),
+        snapbox::str![[r#"
+on
+off
+"#]],
+    );
+    assert_data_eq!(
+        complete_multicall(&mut cmd, "/opt/tools/t.exe", "-- ", 2),
+        snapbox::str![[r#"
+on
+off
+"#]],
+    );
+    assert_data_eq!(
+        complete_multicall(&mut cmd, "/usr/bin/unknown", "-- ", 2),
+        snapbox::str![],
+    );
+}
+
+fn complete_multicall(cmd: &mut Command, argv0: &str, input: &str, arg_index: usize) -> String {
+    let mut args = vec![std::ffi::OsString::from(argv0)];
+    args.extend(input.split_whitespace().map(std::ffi::OsString::from));
+    if input.ends_with(char::is_whitespace) {
+        args.push(std::ffi::OsString::default());
+    }
+    assert_eq!(args.len(), arg_index + 1);
+
+    clap_complete::engine::complete(cmd, args, arg_index, None)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| {
+            let compl = candidate.get_value().to_str().unwrap();
+            if let Some(help) = candidate.get_help() {
+                format!("{compl}\t{help}")
+            } else {
+                compl.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
