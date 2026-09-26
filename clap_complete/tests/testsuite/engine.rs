@@ -1304,6 +1304,228 @@ a_pos,c_pos
 }
 
 #[test]
+fn suggest_delimited_multi_value_segments() {
+    // `--format` takes at most two comma-separated values from a fixed set and
+    // conflicts with `--raw`; completion of the segment under the cursor must
+    // distinguish it from the segments already closed.
+    fn command() -> Command {
+        Command::new("fmt")
+            .arg(
+                clap::Arg::new("format")
+                    .long("format")
+                    .visible_alias("fmt-kind")
+                    .short('f')
+                    .num_args(1..=2)
+                    .value_parser([
+                        PossibleValue::new("json"),
+                        PossibleValue::new("yaml"),
+                        PossibleValue::new("toml"),
+                    ])
+                    .value_delimiter(','),
+            )
+            .arg(
+                clap::Arg::new("raw")
+                    .long("raw")
+                    .visible_alias("unformatted")
+                    .short('r')
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("format"),
+            )
+            .arg(
+                clap::Arg::new("verbose")
+                    .long("verbose")
+                    .short('v')
+                    .action(clap::ArgAction::SetTrue),
+            )
+    }
+
+    // A closed `--format=json,` keeps accepting the second segment on the next
+    // empty word; `json` is already selected and the conflicting `--raw` (name,
+    // alias and short) stays suppressed.  Because the dangling comma makes the
+    // next segment mandatory, no unrelated option is offered there.
+    assert_data_eq!(
+        complete!(command(), "--format=json, [TAB]"),
+        snapbox::str![[r#"
+yaml
+toml
+"#]]
+    );
+
+    // Editing the same word filters the second segment on the text after the
+    // last comma only; the unfinished word has not changed the conflict set
+    // beyond recording `format`.
+    assert_data_eq!(
+        complete!(command(), "--format=json,y[TAB]"),
+        snapbox::str!["--format=json,yaml"]
+    );
+
+    // The already selected `json` is never offered again, including via alias
+    // and short spellings.
+    assert_data_eq!(
+        complete!(command(), "--format=json,j[TAB]"),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(command(), "--fmt-kind=json,[TAB]"),
+        snapbox::str![[r#"
+--fmt-kind=json,yaml
+--fmt-kind=json,toml
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "-fjson,[TAB]"),
+        snapbox::str![[r#"
+-fjson,yaml
+-fjson,toml
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "-f=json,[TAB]"),
+        snapbox::str![[r#"
+-f=json,yaml
+-f=json,toml
+"#]]
+    );
+
+    // Space-separated value words reach the same selected state.
+    assert_data_eq!(
+        complete!(command(), "--format json, [TAB]"),
+        snapbox::str![[r#"
+yaml
+toml
+"#]]
+    );
+
+    // Once two values are closed, value taking ends and ordinary option
+    // completion returns, with `raw` still suppressed.
+    assert_data_eq!(
+        complete!(command(), "--format=json,yaml [TAB]"),
+        snapbox::str![[r#"
+--format
+--verbose
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format json,yaml [TAB]"),
+        snapbox::str![[r#"
+--format
+--verbose
+--help	Print help
+"#]]
+    );
+
+    // A dangling comma after the last segment, or a third segment, cannot be
+    // part of a valid command line: completion errors rather than guessing.
+    for input in [
+        "--format=json,yaml, [TAB]",
+        "--format=json,yaml,toml [TAB]",
+        "--format=json,yaml, --unformatted[TAB]",
+        "--format=json,yaml, junk[TAB]",
+    ] {
+        assert_eq!(complete_err(&mut command(), input), "no completion generated");
+    }
+
+    // Editing the overfull word itself is illegal as well.
+    for input in [
+        "--format=json,yaml,[TAB]",
+        "--format=json,yaml,t[TAB]",
+        "--format=json,,[TAB]",
+    ] {
+        assert_eq!(complete_err(&mut command(), input), "no completion generated");
+    }
+
+    // Empty value segments are never silently accepted.
+    for input in [
+        "--format=,json[TAB]",
+        "--format=,[TAB]",
+        "--format=json,,y[TAB]",
+        "-f=json,,[TAB]",
+    ] {
+        assert_eq!(complete_err(&mut command(), input), "no completion generated");
+    }
+
+    // An unfinished single segment keeps filtering like any value, and an
+    // unknown prefix simply has no candidate.
+    assert_data_eq!(
+        complete!(command(), "--format=z[TAB]"),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format=json,z[TAB]"),
+        snapbox::str![""]
+    );
+
+    // The established state survives `--`; only positionals are completed
+    // afterwards (there are none here), even after a dangling comma.
+    assert_data_eq!(
+        complete!(command(), "--format=json,yaml -- [TAB]"),
+        snapbox::str![""]
+    );
+    assert_eq!(
+        complete_err(&mut command(), "--format=json, -- [TAB]"),
+        "no completion generated"
+    );
+}
+
+#[test]
+fn suggest_delimited_multi_value_conflict_suppression() {
+    fn command() -> Command {
+        Command::new("fmt")
+            .arg(
+                clap::Arg::new("format")
+                    .long("format")
+                    .num_args(1..=2)
+                    .value_parser(["json", "yaml"])
+                    .value_delimiter(','),
+            )
+            .arg(
+                clap::Arg::new("raw")
+                    .long("raw")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("format"),
+            )
+    }
+
+    // While the second segment is open, typing the conflicting option offers
+    // nothing in the dangling-segment value position.
+    assert_data_eq!(
+        complete!(command(), "--format=json, --r[TAB]"),
+        snapbox::str![""]
+    );
+
+    // With the occurrence complete, the conflicting option name is suppressed,
+    // whether the values arrived through `=` or separate words.
+    assert_data_eq!(
+        complete!(command(), "--format=json,yaml --r[TAB]"),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format json,yaml --r[TAB]"),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format=json --r[TAB]"),
+        snapbox::str![""]
+    );
+}
+
+fn complete_err(cmd: &mut Command, args: impl AsRef<str>) -> String {
+    let input = args.as_ref();
+    let mut raw = vec![std::ffi::OsString::from(cmd.get_name())];
+    if let Some((prior, _after)) = input.split_once("[TAB]") {
+        raw.extend(prior.split_whitespace().map(From::from));
+        if prior.ends_with(char::is_whitespace) {
+            raw.push(std::ffi::OsString::default());
+        }
+    }
+    let arg_index = raw.len() - 1;
+    clap_complete::engine::complete(cmd, raw, arg_index, None)
+        .unwrap_err()
+        .to_string()
+}
+
+#[test]
 fn suggest_allow_hyphen() {
     let mut cmd = Command::new("exhaustive")
         .arg(

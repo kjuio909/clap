@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 - *(dynamic)* Hide completion candidates that conflict with options already present on the command line
 
+### Fixes
+
+- *(dynamic)* Complete the current `value_delimiter` segment of a multi-value argument independently of the segments already typed, respecting its value limit, suppressing already selected values and rejecting overfull or malformed values
+
 ## [4.6.10] - 2026-09-14
 
 ## [4.6.9] - 2026-08-06
