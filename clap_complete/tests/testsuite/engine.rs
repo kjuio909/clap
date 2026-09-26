@@ -1531,6 +1531,43 @@ pos-c
     );
 }
 
+#[test]
+fn suggest_subcommand_alias_option_value() {
+    fn cmd() -> Command {
+        Command::new("tool").subcommand(
+            Command::new("remote").visible_alias("r").subcommand(
+                Command::new("show")
+                    .visible_alias("s")
+                    .arg(
+                        clap::Arg::new("format")
+                            .long("format")
+                            .value_parser(["json", "yaml"]),
+                    )
+                    .arg(clap::Arg::new("target").value_parser(["all", "changed"])),
+            ),
+        )
+    }
+
+    let expected = "json\nyaml";
+    assert_data_eq!(complete!(cmd(), "remote show --format "), expected);
+    assert_data_eq!(complete!(cmd(), "r show --format "), expected);
+    assert_data_eq!(complete!(cmd(), "remote s --format "), expected);
+    assert_data_eq!(complete!(cmd(), "r s --format "), expected);
+
+    assert_data_eq!(complete!(cmd(), "r s --format j"), snapbox::str!["json"]);
+
+    assert_data_eq!(complete!(cmd(), "r s --format z"), snapbox::str![""]);
+    assert_data_eq!(complete!(cmd(), "zz"), snapbox::str![""]);
+
+    assert_data_eq!(
+        complete!(cmd(), "r s -- "),
+        snapbox::str![[r#"
+all
+changed
+"#]]
+    );
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
