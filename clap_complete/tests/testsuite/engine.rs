@@ -1758,6 +1758,283 @@ fn suggest_keeps_overrides_with_candidates() {
 }
 
 #[test]
+fn suggest_conflicting_short_flags() {
+    fn command() -> Command {
+        Command::new("exhaustive")
+            .arg(
+                clap::Arg::new("fast")
+                    .short('f')
+                    .long("fast")
+                    .visible_short_alias('q')
+                    .visible_alias("quick")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("safe"),
+            )
+            .arg(
+                clap::Arg::new("safe")
+                    .short('s')
+                    .long("safe")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                clap::Arg::new("tag")
+                    .short('t')
+                    .long("tag")
+                    .value_parser(["alpha", "beta"])
+                    .conflicts_with("fast"),
+            )
+    }
+
+    // A short flag suppresses its conflicts just like the long form: after
+    // `-s`, neither `-f`/`--fast` nor its aliases may be offered.
+    assert_data_eq!(
+        complete!(command(), "-s [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-s -[TAB]"),
+        snapbox::str![[r#"
+-s	--safe
+-t	--tag
+-h	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-s --q[TAB]"),
+        snapbox::str![]
+    );
+
+    // Conflicts are bidirectional for shorts too: `-f` hides `-s`/`--safe`,
+    // and `--tag` because `tag` conflicts with the present `fast`.
+    assert_data_eq!(
+        complete!(command(), "-f [TAB]"),
+        snapbox::str![[r#"
+--fast
+--help	Print help
+"#]],
+    );
+
+    // A value-taking short option with a separate value word: the value is
+    // not mistaken for another option, and `fast` is suppressed afterwards.
+    assert_data_eq!(
+        complete!(command(), "-t alpha [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // Same with the value glued to the flag, with or without `=`.
+    assert_data_eq!(
+        complete!(command(), "-talpha [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-t=alpha [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // A glued value that happens to be a valid flag character is still the
+    // value of `-t`, not the `fast` flag.
+    assert_data_eq!(
+        complete!(command(), "-tf [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // While the value of `-t` is still being typed, only its own value
+    // candidates are offered; conflict results of later options do not apply
+    // yet.
+    assert_data_eq!(
+        complete!(command(), "-t [TAB]"),
+        snapbox::str![[r#"
+alpha
+beta
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-t al[TAB]"),
+        snapbox::str!["alpha"]
+    );
+    assert_data_eq!(
+        complete!(command(), "-tal[TAB]"),
+        snapbox::str!["-talpha"]
+    );
+
+    // Every member of a short flag cluster participates in the conflict
+    // checks, in both directions: with both `safe` and `fast` present,
+    // neither suppresses the other, but `tag` is hidden by `fast`.
+    assert_data_eq!(
+        complete!(command(), "-sf [TAB]"),
+        snapbox::str![[r#"
+--fast
+--safe
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-fs [TAB]"),
+        snapbox::str![[r#"
+--fast
+--safe
+--help	Print help
+"#]],
+    );
+
+    // A cluster ending in a value-taking member records that member; the
+    // rest of the cluster (or the following word) is its value.
+    assert_data_eq!(
+        complete!(command(), "-st alpha [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "-stalpha [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // A value-taking member in the middle of a cluster absorbs the rest of
+    // the cluster as its value: `s` is tag's value, not the `safe` flag, so
+    // `safe` stays suppressed by the present `fast`.
+    assert_data_eq!(
+        complete!(command(), "-fts [TAB]"),
+        snapbox::str![[r#"
+--fast
+--tag
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
+fn suggest_conflicting_short_option_values() {
+    fn command() -> Command {
+        Command::new("exhaustive")
+            .arg(
+                clap::Arg::new("mode")
+                    .short('m')
+                    .long("mode")
+                    .value_parser(["fast", "slow"])
+                    .conflicts_with("safe"),
+            )
+            .arg(
+                clap::Arg::new("safe")
+                    .short('s')
+                    .long("safe")
+                    .action(clap::ArgAction::SetTrue),
+            )
+    }
+
+    // A short option with a separate value word suppresses its conflicts
+    // just like the long form.
+    assert_data_eq!(
+        complete!(command(), "-m fast [TAB]"),
+        snapbox::str![[r#"
+--mode
+--help	Print help
+"#]],
+    );
+
+    // Same with the value glued to the flag.
+    assert_data_eq!(
+        complete!(command(), "-mfast [TAB]"),
+        snapbox::str![[r#"
+--mode
+--help	Print help
+"#]],
+    );
+
+    // The suppressed option's value candidates disappear along with its
+    // names, whether the value would be glued to a short flag or follow a
+    // long option.
+    assert_data_eq!(
+        complete!(command(), "-s -m[TAB]"),
+        snapbox::str![]
+    );
+    assert_data_eq!(
+        complete!(command(), "-s --mode=[TAB]"),
+        snapbox::str![]
+    );
+}
+
+#[test]
+fn suggest_conflicting_short_flag_groups() {
+    fn command() -> Command {
+        Command::new("exhaustive")
+            .arg(clap::Arg::new("a").short('a').long("a").action(clap::ArgAction::SetTrue))
+            .arg(clap::Arg::new("b").short('b').long("b").action(clap::ArgAction::SetTrue))
+            .arg(
+                clap::Arg::new("other")
+                    .short('o')
+                    .long("other")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .group(
+                clap::ArgGroup::new("ab")
+                    .args(["a", "b"])
+                    .conflicts_with("other"),
+            )
+    }
+
+    // A conflict with a group is expanded to every member: `-o` hides
+    // `-a` and `-b`, in both directions.
+    assert_data_eq!(
+        complete!(command(), "-o [TAB]"),
+        snapbox::str![[r#"
+--other
+--help	Print help
+"#]],
+    );
+
+    // `-a` hides `--other` through the group and hides `--b` because the
+    // group is not `multiple`.
+    assert_data_eq!(
+        complete!(command(), "-a [TAB]"),
+        snapbox::str![[r#"
+--a
+--help	Print help
+"#]],
+    );
+
+    // A multiple(true) group lets its members coexist.
+    let mut cmd = Command::new("exhaustive")
+        .arg(clap::Arg::new("a").short('a').long("a").action(clap::ArgAction::SetTrue))
+        .arg(clap::Arg::new("b").short('b').long("b").action(clap::ArgAction::SetTrue))
+        .group(clap::ArgGroup::new("ab").args(["a", "b"]).multiple(true));
+    assert_data_eq!(
+        complete!(cmd, "-a [TAB]"),
+        snapbox::str![[r#"
+--a
+--b
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
 fn suggest_no_options_after_escape_with_conflicts() {
     let mut cmd = Command::new("exhaustive")
         .arg(
@@ -1765,11 +2042,13 @@ fn suggest_no_options_after_escape_with_conflicts() {
         )
         .arg(
             clap::Arg::new("fast")
+                .short('f')
                 .long("fast")
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
             clap::Arg::new("safe")
+                .short('s')
                 .long("safe")
                 .action(clap::ArgAction::SetTrue)
                 .conflicts_with("fast"),
@@ -1778,6 +2057,16 @@ fn suggest_no_options_after_escape_with_conflicts() {
     // After `--` only positional arguments are completed, conflicts or not.
     assert_data_eq!(
         complete!(cmd, "--fast -- [TAB]"),
+        snapbox::str![[r#"
+pos-a
+pos-b
+pos-c
+"#]],
+    );
+
+    // Same when the conflicting option was given as a short flag.
+    assert_data_eq!(
+        complete!(cmd, "-s -- [TAB]"),
         snapbox::str![[r#"
 pos-a
 pos-b
