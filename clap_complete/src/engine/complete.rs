@@ -100,6 +100,13 @@ pub fn complete(
 
                 if let Some(opt) = opt {
                     explicit_opts.insert(opt.get_id().clone());
+                    // A value attached with `=` (`--name=value`) is consumed by
+                    // this word itself, so it never enters `Opt` state: the
+                    // following word is parsed as a fresh token, never as the
+                    // option's value or a positional. This holds even for
+                    // multi-valued options and with value delimiters, matching
+                    // clap's parser (attached values are always "done"). Only a
+                    // bare `--name` enters `Opt` state to read the next word.
                     if opt.get_num_args().expect("built").takes_values() && value.is_none() {
                         next_state = ParseState::Opt((opt, 1));
                     };

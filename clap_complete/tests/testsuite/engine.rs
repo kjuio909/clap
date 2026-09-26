@@ -1830,6 +1830,284 @@ v2
 }
 
 #[test]
+fn suggest_conflicts_attached_long_value() {
+    // A closed `--name=value` word before the cursor is parsed exactly like the
+    // separate `--name value` form: the option name counts as present and the
+    // attached value is consumed, never seen as another option or positional.
+    fn command() -> Command {
+        Command::new("exhaustive")
+            .arg(
+                clap::Arg::new("safe")
+                    .long("safe")
+                    .action(clap::ArgAction::SetTrue),
+            )
+            .arg(
+                clap::Arg::new("fast")
+                    .long("fast")
+                    .short('f')
+                    .visible_alias("quick")
+                    .alias("speedy")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("safe"),
+            )
+            .arg(
+                clap::Arg::new("tag")
+                    .long("tag")
+                    .short('t')
+                    .value_parser(["red", "blue"])
+                    .conflicts_with("fast"),
+            )
+    }
+
+    // `--tag=red` before a fresh empty word: same result as `--tag red`.
+    assert_data_eq!(
+        complete!(command(), "--tag=red [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // The conflict carries onto later options regardless of how they are typed.
+    assert_data_eq!(complete!(command(), "--tag=red --f[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(command(), "--tag=red --fast[TAB]"), snapbox::str![""]);
+    assert_data_eq!(
+        complete!(command(), "--tag=red -[TAB]"),
+        snapbox::str![[r#"
+--safe
+-t	--tag
+-h	Print help
+"#]],
+    );
+    // Visible and hidden aliases and the value candidates of `fast` vanish too.
+    assert_data_eq!(complete!(command(), "--tag=red --q[TAB]"), snapbox::str![""]);
+    assert_data_eq!(
+        complete!(command(), "--tag=red --spe[TAB]"),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(command(), "--tag=red --fast=[TAB]"),
+        snapbox::str![""]
+    );
+
+    // A value attached through `=` that merely looks like an option belongs to
+    // `tag`; it must not be parsed as `--safe`/`--fast`.
+    assert_data_eq!(
+        complete!(command(), "--tag=--safe [TAB]"),
+        snapbox::str![[r#"
+--safe
+--tag
+--help	Print help
+"#]],
+    );
+
+    // Editing the value behind `=` follows the normal prefix rules and never
+    // crosses the `=` to complete option names.
+    assert_data_eq!(
+        complete!(command(), "--tag=[TAB]"),
+        snapbox::str![[r#"
+--tag=red
+--tag=blue
+"#]],
+    );
+    assert_data_eq!(
+        complete!(command(), "--tag=r[TAB]"),
+        snapbox::str!["--tag=red"]
+    );
+
+    // A value-less flag typed with `=` keeps the existing empty candidate
+    // semantics; its name was still present, so the conflict it declares
+    // applies to the following words.
+    assert_data_eq!(
+        complete!(command(), "--fast=true [TAB]"),
+        snapbox::str![[r#"
+--fast
+--help	Print help
+"#]],
+    );
+
+    // An unknown long name records no state, so nothing is suppressed.
+    assert_data_eq!(
+        complete!(command(), "--unknown=x [TAB]"),
+        snapbox::str![[r#"
+--safe
+--fast
+--tag
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
+fn suggest_attached_value_not_positional() {
+    // The attached value does not occupy a positional slot.
+    let mut cmd = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .value_parser(["red", "blue"]),
+        )
+        .arg(clap::Arg::new("first").index(1).value_parser(["one", "two"]));
+
+    assert_data_eq!(
+        complete!(cmd, "--tag=red [TAB]"),
+        snapbox::str![[r#"
+one
+two
+--tag
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
+fn suggest_attached_value_after_escape_and_groups() {
+    // Conflict state established through `=` survives `--`; after it only
+    // positionals are completed.
+    let mut cmd = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .value_parser(["red", "blue"])
+                .conflicts_with("fast"),
+        )
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .short('f')
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(clap::Arg::new("first").index(1).value_parser(["one", "two"]));
+
+    assert_data_eq!(
+        complete!(cmd, "--tag=red -- [TAB]"),
+        snapbox::str![[r#"
+one
+two
+"#]],
+    );
+
+    // ArgGroup expansion works through the attached form: the non-`multiple`
+    // group member `file` is suppressed by `--tag=red`.
+    let mut grouped = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .value_parser(["red", "blue"]),
+        )
+        .arg(
+            clap::Arg::new("file")
+                .long("file")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .group(clap::ArgGroup::new("payload").args(["tag", "file"]));
+    assert_data_eq!(
+        complete!(grouped, "--tag=red [TAB]"),
+        snapbox::str![[r#"
+--tag
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
+fn suggest_attached_delimiter_and_multi_values() {
+    // Every segment of a delimited attached value belongs to the option; the
+    // option is present and its conflict partner stays suppressed afterwards.
+    let mut cmd = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("list")
+                .long("list")
+                .value_parser(["a", "b", "c"])
+                .value_delimiter(',')
+                .num_args(1..=3)
+                .conflicts_with("fast"),
+        )
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .short('f')
+                .action(clap::ArgAction::SetTrue),
+        );
+
+    assert_data_eq!(
+        complete!(cmd, "--list=a,b [TAB]"),
+        snapbox::str![[r#"
+--list
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(complete!(cmd, "--list=a,b --f[TAB]"), snapbox::str![""]);
+    // Completing a later delimiter segment still uses the option's values.
+    assert_data_eq!(
+        complete!(cmd, "--list=a,[TAB]"),
+        snapbox::str![[r#"
+--list=a,a
+--list=a,b
+--list=a,c
+"#]],
+    );
+
+    // An attached value always closes the word, even for a multi-value option:
+    // following words are options, and the conflict persists.
+    let mut multi = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("multi")
+                .long("multi")
+                .value_parser(["a", "b", "c"])
+                .num_args(1..=3)
+                .conflicts_with("fast"),
+        )
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .short('f')
+                .action(clap::ArgAction::SetTrue),
+        );
+    assert_data_eq!(
+        complete!(multi, "--multi=a [TAB]"),
+        snapbox::str![[r#"
+--multi
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(complete!(multi, "--multi=a --f[TAB]"), snapbox::str![""]);
+}
+
+#[test]
+fn suggest_attached_value_with_no_binary_name() {
+    // With `no_binary_name`, an attached-value word at the very start is still
+    // parsed as the option and establishes its conflict state.
+    let mut cmd = Command::new("exhaustive")
+        .no_binary_name(true)
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .value_parser(["red", "blue"])
+                .conflicts_with("fast"),
+        )
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .short('f')
+                .action(clap::ArgAction::SetTrue),
+        );
+
+    let completions = clap_complete::engine::complete(
+        &mut cmd,
+        vec!["--tag=red".into(), "".into()],
+        1,
+        None,
+    )
+    .unwrap()
+    .into_iter()
+    .map(|c| c.get_value().to_str().unwrap().to_owned())
+    .collect::<Vec<_>>();
+    assert_eq!(completions, vec!["--tag", "--help"]);
+}
+
+#[test]
 fn complete_no_binary_name_short_records_state() {
     fn command() -> Command {
         Command::new("exhaustive")
