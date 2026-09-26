@@ -32,12 +32,26 @@ pub fn complete(
     raw_args.next_os(&mut target_cursor);
     debug!("complete: target_cursor={target_cursor:?}");
 
-    // TODO: Multicall support
-    if !cmd.is_no_binary_name_set() {
+    let mut current_cmd = &*cmd;
+    if cmd.is_multicall_set() {
+        // A multicall binary dispatches on argv0: the applet is selected by the
+        // file stem of the invoked path, mirroring runtime parsing.
+        let applet = raw_args.next_os(&mut cursor).and_then(|argv0| {
+            std::path::Path::new(argv0)
+                .file_stem()
+                .map(|s| s.to_owned())
+        });
+        let Some(applet) = applet else {
+            return Ok(Vec::new());
+        };
+        let Some(applet_cmd) = cmd.find_subcommand(&applet) else {
+            // Unknown applets must not leak the known applet names
+            return Ok(Vec::new());
+        };
+        current_cmd = applet_cmd;
+    } else if !cmd.is_no_binary_name_set() {
         raw_args.next_os(&mut cursor);
     }
-
-    let mut current_cmd = &*cmd;
     let mut pos_index = 1;
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;

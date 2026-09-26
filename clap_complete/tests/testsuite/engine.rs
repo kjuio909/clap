@@ -1531,6 +1531,131 @@ pos-c
     );
 }
 
+#[test]
+fn suggest_subcommand_alias_path() {
+    fn tool() -> Command {
+        Command::new("tool")
+            .disable_help_flag(true)
+            .disable_help_subcommand(true)
+            .subcommand(
+                Command::new("remote").alias("r").subcommand(
+                    Command::new("show")
+                        .alias("s")
+                        .arg(
+                            clap::Arg::new("format")
+                                .long("format")
+                                .value_parser(["json", "yaml"]),
+                        )
+                        .arg(clap::Arg::new("target").value_parser(["all", "changed"])),
+                ),
+            )
+            .subcommand(Command::new("status"))
+    }
+
+    let mut cmd = tool();
+
+    for sub_path in ["remote show", "r show", "remote s", "r s"] {
+        assert_data_eq!(
+            complete!(cmd, format!("{sub_path} --format [TAB]")),
+            snapbox::str![[r#"
+json
+yaml
+"#]],
+        );
+
+        assert_data_eq!(
+            complete!(cmd, format!("{sub_path} --format j[TAB]")),
+            snapbox::str!["json"],
+        );
+
+        assert_data_eq!(
+            complete!(cmd, format!("{sub_path} -- [TAB]")),
+            snapbox::str![[r#"
+all
+changed
+"#]],
+        );
+    }
+
+    assert_data_eq!(
+        complete!(cmd, " [TAB]"),
+        snapbox::str![[r#"
+remote
+status
+"#]],
+    );
+
+    // Unknown names, partial aliases, and invalid value prefixes complete to nothing
+    assert_data_eq!(complete!(cmd, "unknown[TAB]"), snapbox::str![]);
+    assert_data_eq!(complete!(cmd, "remote unknown[TAB]"), snapbox::str![]);
+    assert_data_eq!(complete!(cmd, "remote show unknown[TAB]"), snapbox::str![]);
+    assert_data_eq!(complete!(cmd, "remote show --format x[TAB]"), snapbox::str![]);
+    assert_data_eq!(complete!(cmd, "r s --format x[TAB]"), snapbox::str![]);
+}
+
+#[test]
+fn suggest_multicall_applet() {
+    fn applet_true() -> Command {
+        Command::new("true")
+            .arg(clap::Arg::new("on-off").value_parser(["on", "off"]))
+    }
+
+    let mut cmd = Command::new("busybox")
+        .multicall(true)
+        .subcommand(
+            Command::new("busybox")
+                .subcommand(applet_true())
+                .subcommand(Command::new("false")),
+        )
+        .subcommand(applet_true().alias("t"))
+        .subcommand(Command::new("false"));
+
+    let complete_multicall = |cmd: &mut Command, args: &[&str], arg_index: usize| {
+        clap_complete::engine::complete(
+            cmd,
+            args.iter().map(std::ffi::OsString::from).collect(),
+            arg_index,
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_str().unwrap().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+    };
+
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["/usr/bin/true", "--", ""], 2),
+        snapbox::str![[r#"
+on
+off
+"#]],
+    );
+
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["/usr/bin/busybox", "true", "--", ""], 3),
+        snapbox::str![[r#"
+on
+off
+"#]],
+    );
+
+    // Applet aliases are resolved from the invoked file stem, extension included
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["/opt/tools/t.exe", "--", ""], 2),
+        snapbox::str![[r#"
+on
+off
+"#]],
+    );
+
+    // Unknown applets must not leak the known applet names
+    assert_data_eq!(
+        complete_multicall(&mut cmd, &["/usr/bin/unknown", "--", ""], 2),
+        snapbox::str![],
+    );
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
