@@ -32,12 +32,32 @@ pub fn complete(
     raw_args.next_os(&mut target_cursor);
     debug!("complete: target_cursor={target_cursor:?}");
 
-    // TODO: Multicall support
-    if !cmd.is_no_binary_name_set() {
+    let mut current_cmd = &*cmd;
+    if cmd.is_multicall_set() {
+        // In a multicall command, `argv[0]` names the applet to run.  Resolve
+        // it the same way `Command` does when parsing: strip the directory and
+        // extension from the binary path and match the result against the
+        // top-level subcommands.  When no applet can be resolved the invocation
+        // name is unknown, so completion is empty rather than falling back to
+        // the (argument-less) root command.
+        let Some(applet) = raw_args
+            .next_os(&mut cursor)
+            .and_then(|argv0| std::path::Path::new(argv0).file_stem())
+        else {
+            return Ok(Vec::new());
+        };
+        let Some(applet_cmd) = current_cmd.find_subcommand(applet) else {
+            debug!(
+                "complete: multicall applet {:?} is not a subcommand",
+                applet.to_string_lossy()
+            );
+            return Ok(Vec::new());
+        };
+        current_cmd = applet_cmd;
+    } else if !cmd.is_no_binary_name_set() {
         raw_args.next_os(&mut cursor);
     }
 
-    let mut current_cmd = &*cmd;
     let mut pos_index = 1;
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
@@ -352,14 +372,189 @@ fn complete_arg_value(
     let mut values = Vec::new();
     debug!("complete_arg_value: arg={arg:?}, value={value:?}, arg_index={arg_index:?}");
 
-    let (prefix, value) =
-        rsplit_delimiter(value, arg.get_value_delimiter()).unwrap_or((None, value));
+    let value_os = match value {
+        Ok(value) => OsStr::new(value),
+        Err(value_os) => value_os,
+    };
+
+    // Delimited, bounded multi-value arguments are completed segment by
+    // segment: the already typed segments are validated as-is and kept in the
+    // candidate, while the segment under the cursor is completed from the
+    // values still available for this occurrence.  Arguments whose candidate
+    // set cannot be enumerated (dynamic completers, path hints) and
+    // single/unbounded values keep the legacy last-segment behavior.
+    if let Some(delimiter) = arg.get_value_delimiter() {
+        let range = arg.get_num_args().expect("built");
+        let bounded_multi = 1 < range.max_values() && range.max_values() < usize::MAX;
+        if bounded_multi {
+            if let Ok(value) = value {
+                if let Some(delimited) = complete_delimited_arg_value(value, arg, delimiter) {
+                    values = delimited;
+                } else {
+                    complete_legacy_arg_value(
+                        &mut values,
+                        Ok(value),
+                        arg,
+                        current_dir,
+                        arg_index,
+                        delimiter,
+                    );
+                }
+            }
+        } else {
+            complete_legacy_arg_value(&mut values, value, arg, current_dir, arg_index, delimiter);
+        }
+    } else {
+        complete_single_arg_value(&mut values, value_os, arg, current_dir, arg_index);
+    }
+
+    values = values
+        .into_iter()
+        .map(|comp| {
+            if comp.get_tag().is_some() {
+                comp
+            } else {
+                comp.tag(Some(arg.to_string().into()))
+            }
+        })
+        .collect();
+
+    debug!("complete_arg_value: values={values:?}");
+    values
+}
+
+/// Legacy delimiter completion: only the segment after the last delimiter is
+/// completed and re-prefixed with everything typed before it.
+fn complete_legacy_arg_value(
+    values: &mut Vec<CompletionCandidate>,
+    value: Result<&str, &OsStr>,
+    arg: &clap::Arg,
+    current_dir: Option<&std::path::Path>,
+    arg_index: usize,
+    delimiter: char,
+) {
+    let (prefix, value) = rsplit_delimiter(value, Some(delimiter)).unwrap_or((None, value));
 
     let value_os = match value {
         Ok(value) => OsStr::new(value),
         Err(value_os) => value_os,
     };
 
+    complete_single_arg_value(values, value_os, arg, current_dir, arg_index);
+
+    if let Some(prefix) = prefix {
+        let prefixed = std::mem::take(values);
+        values.extend(prefixed.into_iter().map(|comp| comp.add_prefix(prefix)));
+    }
+}
+
+/// Complete the (last, possibly empty) segment of a delimiter-separated value.
+///
+/// Returns `None` when the candidate source cannot be enumerated to validate
+/// committed segments (a dynamic [`ArgValueCompleter`], paths, ...), so the
+/// caller can fall back to the legacy behavior.  Returns an empty `Vec` for
+/// input that cannot lead anywhere (empty segment, unknown segment, too many
+/// segments): no completion, and never a fallback to other arguments.
+fn complete_delimited_arg_value(
+    value: &str,
+    arg: &clap::Arg,
+    delimiter: char,
+) -> Option<Vec<CompletionCandidate>> {
+    debug!("complete_delimited_arg_value: arg={arg:?}, value={value:?}");
+
+    // Every segment the user typed is relevant, including an empty trailing
+    // segment (the cursor sits right after a delimiter).
+    let mut segments: Vec<&str> = value.split(delimiter).collect();
+    let current = segments
+        .pop()
+        .expect("split always yields at least one segment");
+    let committed = segments;
+
+    let max_values = arg.get_num_args().expect("built").max_values();
+
+    let Some(pool) = enumerable_arg_value_candidates(arg) else {
+        // Dynamic completers and path hints cannot be enumerated to validate
+        // the committed segments against.
+        return None;
+    };
+
+    // Validate committed segments in order: each must name a candidate and no
+    // candidate may be reused within one occurrence.  An empty segment (from a
+    // consecutive or trailing-vs-leading delimiter) is never valid.
+    let mut used: Vec<String> = Vec::with_capacity(committed.len());
+    for segment in &committed {
+        if segment.is_empty() {
+            return Some(Vec::new());
+        }
+        let Some(name) = pool
+            .iter()
+            .map(|c| c.get_value())
+            .find(|name| *name == OsStr::new(segment))
+            .and_then(|name| name.to_str())
+        else {
+            return Some(Vec::new());
+        };
+        if used.iter().any(|used| used == name) {
+            return Some(Vec::new());
+        }
+        used.push(name.to_owned());
+    }
+
+    // Committed segments already fill (or overflow) the per-occurrence bound;
+    // the segment under the cursor cannot become another value.
+    if committed.len() >= max_values {
+        return Some(Vec::new());
+    }
+
+    // Rebuild the text that must precede every candidate so already typed
+    // segments are preserved verbatim.  It is `value` with the current segment
+    // removed from the end.
+    let mut prefix = String::with_capacity(value.len());
+    for segment in &committed {
+        prefix.push_str(segment);
+        prefix.push(delimiter);
+    }
+
+    let mut completions = Vec::new();
+    for candidate in pool {
+        let Some(name) = candidate.get_value().to_str() else {
+            continue;
+        };
+        if used.iter().any(|used| used == name) {
+            continue;
+        }
+        if !name.starts_with(current) {
+            continue;
+        }
+        completions.push(candidate.add_prefix(prefix.clone()));
+    }
+    Some(completions)
+}
+
+/// Enumerate every possible value candidate for an argument when the candidate
+/// set is static and complete.
+///
+/// Dynamic [`ArgValueCompleter`]s and open-ended value hints (paths, ...)
+/// cannot be enumerated, so they return `None`.
+fn enumerable_arg_value_candidates(arg: &clap::Arg) -> Option<Vec<CompletionCandidate>> {
+    if arg.get::<ArgValueCompleter>().is_some() {
+        // A dynamic completer cannot be enumerated.
+        None
+    } else if let Some(candidates) = arg.get::<ArgValueCandidates>() {
+        Some(candidates.candidates())
+    } else {
+        possible_values(arg).map(possible_value_candidates)
+    }
+}
+
+fn complete_single_arg_value(
+    values: &mut Vec<CompletionCandidate>,
+    value_os: &OsStr,
+    arg: &clap::Arg,
+    current_dir: Option<&std::path::Path>,
+    arg_index: usize,
+) {
+    let value = value_os.to_str();
     if let Some(completer) = arg.get::<ArgValueCompleter>() {
         values.extend(completer.complete_at(arg_index, value_os));
     } else if let Some(completer) = arg.get::<ArgValueCandidates>() {
@@ -368,7 +563,7 @@ fn complete_arg_value(
             completer.value_candidates(),
         ));
     } else if let Some(possible_values) = possible_values(arg) {
-        if let Ok(value) = value {
+        if let Some(value) = value {
             values.extend(complete_candidates_str(
                 value,
                 possible_value_candidates(possible_values),
@@ -409,26 +604,6 @@ fn complete_arg_value(
 
         values.sort();
     }
-
-    if let Some(prefix) = prefix {
-        values = values
-            .into_iter()
-            .map(|comp| comp.add_prefix(prefix))
-            .collect();
-    }
-    values = values
-        .into_iter()
-        .map(|comp| {
-            if comp.get_tag().is_some() {
-                comp
-            } else {
-                comp.tag(Some(arg.to_string().into()))
-            }
-        })
-        .collect();
-
-    debug!("complete_arg_value: values={values:?}");
-    values
 }
 
 fn rsplit_delimiter<'s, 'o>(

@@ -1531,6 +1531,201 @@ pos-c
     );
 }
 
+fn deploy_command(alias: bool) -> Command {
+    let mut deploy = Command::new("deploy").arg(
+        clap::Arg::new("tag")
+            .long("tag")
+            .short('t')
+            .num_args(1..=2)
+            .value_parser([
+                PossibleValue::new("dev"),
+                PossibleValue::new("prod"),
+                PossibleValue::new("ci"),
+            ])
+            .value_delimiter(','),
+    );
+    if alias {
+        deploy = deploy.visible_alias("d");
+    }
+    deploy.arg(clap::Arg::new("target").value_parser(["all", "changed"]))
+}
+
+#[test]
+fn suggest_repeatable_delimiter_values() {
+    for invocation in ["deploy", "d"] {
+        let mut cmd = Command::new("tool").subcommand(deploy_command(true));
+
+        // An empty segment offers every allowed value in definition order.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag [TAB]")),
+            snapbox::str![[r#"
+dev
+prod
+ci
+"#]],
+        );
+
+        // Only the matching value is offered.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag d[TAB]")),
+            snapbox::str!["dev"]
+        );
+
+        // Attached values keep the `--tag=` prefix.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag=de[TAB]")),
+            snapbox::str!["--tag=dev"]
+        );
+
+        // A committed segment is preserved verbatim and completed only with
+        // values still available for this occurrence, in definition order.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag=dev,[TAB]")),
+            snapbox::str![[r#"
+--tag=dev,prod
+--tag=dev,ci
+"#]],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag dev,[TAB]")),
+            snapbox::str![[r#"
+dev,prod
+dev,ci
+"#]],
+        );
+
+        // An attached short flag follows the same rules.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} -tdev,[TAB]")),
+            snapbox::str![[r#"
+-tdev,prod
+-tdev,ci
+"#]],
+        );
+
+        // The occurrence may carry at most two values.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag=dev,ci,[TAB]")),
+            snapbox::str![""]
+        );
+        // A consecutive delimiter leaves an empty segment.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag=dev,,[TAB]")),
+            snapbox::str![""]
+        );
+        // An unknown value cannot be completed.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag zz[TAB]")),
+            snapbox::str![""]
+        );
+        // An invalid prefix matches no value.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag=dezz[TAB]")),
+            snapbox::str![""]
+        );
+        // Repeating a value within one occurrence is invalid.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag=dev,dev[TAB]")),
+            snapbox::str![""]
+        );
+
+        // A later occurrence starts a fresh, empty segment: committed segments
+        // from the previous occurrence are neither truncated nor rewritten.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag dev --tag [TAB]")),
+            snapbox::str![[r#"
+dev
+prod
+ci
+"#]],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag dev --tag=prod,[TAB]")),
+            snapbox::str![[r#"
+--tag=prod,dev
+--tag=prod,ci
+"#]],
+        );
+
+        // After `--` only the positional's values are offered, never tags.
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} -- [TAB]")),
+            snapbox::str![[r#"
+all
+changed
+"#]],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{invocation} --tag dev -- a[TAB]")),
+            snapbox::str!["all"]
+        );
+    }
+}
+
+#[test]
+fn suggest_multicall_delimiter_values() {
+    // Busybox-style tree: an aggregate `tool` applet plus a top-level `deploy`
+    // applet, both exposing the same `deploy` command.
+    let mut multicall = Command::new("tool")
+        .multicall(true)
+        .subcommand(Command::new("tool").subcommand(deploy_command(false)))
+        .subcommand(deploy_command(true));
+
+    // Direct applet invocation, including with a directory and extension in
+    // argv[0], produces the same candidates as the regular path.
+    assert_data_eq!(
+        complete_args(&mut multicall, &["/usr/local/bin/deploy.exe", "--tag=dev,"], 1),
+        snapbox::str![[r#"
+--tag=dev,prod
+--tag=dev,ci
+"#]],
+    );
+    assert_data_eq!(
+        complete_args(&mut multicall, &["deploy", "--tag", ""], 2),
+        snapbox::str![[r#"
+dev
+prod
+ci
+"#]],
+    );
+    assert_data_eq!(
+        complete_args(&mut multicall, &["d", "-tdev,"], 1),
+        snapbox::str![[r#"
+-tdev,prod
+-tdev,ci
+"#]],
+    );
+
+    // Entering `deploy` through the aggregate applet is identical.
+    assert_data_eq!(
+        complete_args(&mut multicall, &["/usr/bin/tool", "deploy", "--tag=dev,"], 2),
+        snapbox::str![[r#"
+--tag=dev,prod
+--tag=dev,ci
+"#]],
+    );
+
+    // An unknown invocation name completes to nothing instead of falling back
+    // to root command candidates.
+    assert_data_eq!(
+        complete_args(&mut multicall, &["/bin/does-not-exist", "--tag", ""], 2),
+        snapbox::str![""]
+    );
+}
+
+fn complete_args(cmd: &mut Command, args: &[&str], arg_index: usize) -> String {
+    let args = args
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    clap_complete::engine::complete(cmd, args, arg_index, None)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_str().unwrap().to_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];

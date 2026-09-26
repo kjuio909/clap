@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 <!-- next-header -->
 ## [Unreleased] - ReleaseDate
 
+### Features
+
+- *(dynamic)* Complete `multicall` commands by resolving the applet from `argv[0]`
+
+### Fixes
+
+- *(dynamic)* Complete repeatable, delimiter-separated values one segment at a time, preserving committed segments and rejecting empty, unknown, duplicate, or over-limit segments
+
 ## [4.6.10] - 2026-09-14
 
 ## [4.6.9] - 2026-08-06
