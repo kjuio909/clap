@@ -325,7 +325,11 @@ fn complete_option(
     } else if let Some((flag, value)) = arg.to_long() {
         if let Ok(flag) = flag {
             if let Some(value) = value {
-                if let Some(arg) = cmd.get_arguments().find(|a| a.get_long() == Some(flag)) {
+                let opt = cmd.get_arguments().find(|a| {
+                    a.get_long_and_visible_aliases()
+                        .is_some_and(|longs| longs.into_iter().any(|long| long == flag))
+                });
+                if let Some(arg) = opt {
                     if !disabled.contains(arg.get_id()) {
                         completions.extend(
                             complete_arg_value(value.to_str().ok_or(value), arg, current_dir, 0)

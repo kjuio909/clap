@@ -2017,6 +2017,52 @@ pos-c
 }
 
 #[test]
+fn suggest_long_equals_visible_alias_values() {
+    // A value-taking option reached through a visible long alias must offer
+    // the same attached-value candidates as through its canonical long name,
+    // keeping the alias spelling as the candidate prefix.
+    let mut cmd = Command::new("exhaustive")
+        .arg(
+            clap::Arg::new("fast")
+                .long("fast")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .visible_alias("label")
+                .alias("ticket")
+                .value_parser(["red", "blue"])
+                .conflicts_with("fast"),
+        );
+
+    assert_data_eq!(
+        complete!(cmd, "--label=[TAB]"),
+        snapbox::str![[r#"
+--label=red
+--label=blue
+"#]]
+    );
+    assert_data_eq!(
+        complete!(cmd, "--label=r[TAB]"),
+        snapbox::str!["--label=red"]
+    );
+
+    // A closed attached value through the alias restores the same state as the
+    // canonical spelling: `tag` is present and hides `fast`.
+    assert_data_eq!(
+        complete!(cmd, "--label=red [TAB]"),
+        snapbox::str![[r#"
+--tag
+--help	Print help
+"#]]
+    );
+
+    // Hidden aliases stay undiscoverable, including with an attached value.
+    assert_data_eq!(complete!(cmd, "--ticket=r[TAB]"), snapbox::str![""]);
+}
+
+#[test]
 fn complete_no_binary_name_keeps_first_arg() {
     fn command() -> Command {
         Command::new("exhaustive")
