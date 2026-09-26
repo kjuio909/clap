@@ -99,7 +99,7 @@ pub fn complete(
                 }
             }
         } else if let Some(short) = arg.to_short() {
-            let (_, takes_value_opt, mut short) = parse_shortflags(current_cmd, short);
+            let (_, takes_value_opt, mut short, _) = parse_shortflags(current_cmd, short);
             if let Some(opt) = takes_value_opt {
                 if short.next_value_os().is_none() {
                     next_state = ParseState::Opt((opt, 1));
@@ -309,7 +309,12 @@ fn complete_option(
     } else if let Some(short) = arg.to_short() {
         if !short.is_negative_number() {
             // Find the first takes_values option.
-            let (leading_flags, takes_value_opt, mut short) = parse_shortflags(cmd, short);
+            let (leading_flags, takes_value_opt, mut short, all_known) =
+                parse_shortflags(cmd, short);
+            if !all_known {
+                // An unknown flag makes the whole token invalid
+                return completions;
+            }
 
             // Clone `short` to `peek_short` to peek whether the next flag is a `=`.
             if let Some(opt) = takes_value_opt {
@@ -616,12 +621,21 @@ fn populate_command_candidate(
 }
 
 /// Parse the short flags and find the first `takes_values` option.
+///
+/// The returned `bool` is `true` when every flag before the `takes_values`
+/// option (or the whole cluster, when there is none) is a known flag.
 fn parse_shortflags<'c, 's>(
     cmd: &'c clap::Command,
     mut short: clap_lex::ShortFlags<'s>,
-) -> (String, Option<&'c clap::Arg>, clap_lex::ShortFlags<'s>) {
+) -> (
+    String,
+    Option<&'c clap::Arg>,
+    clap_lex::ShortFlags<'s>,
+    bool,
+) {
     let takes_value_opt;
     let mut leading_flags = String::new();
+    let mut all_known = true;
     // Find the first takes_values option.
     loop {
         match short.next_flag() {
@@ -636,12 +650,17 @@ fn parse_shortflags<'c, 's>(
                     });
                     is_find.unwrap_or(false)
                 });
-                if opt
-                    .map(|o| o.get_num_args().expect("built").takes_values())
-                    .unwrap_or(false)
-                {
-                    takes_value_opt = opt;
-                    break;
+                match opt {
+                    Some(opt) if opt.get_num_args().expect("built").takes_values() => {
+                        takes_value_opt = Some(opt);
+                        break;
+                    }
+                    Some(_) => {}
+                    None => {
+                        all_known = false;
+                        takes_value_opt = None;
+                        break;
+                    }
                 }
             }
             Some(Err(_)) | None => {
@@ -651,7 +670,7 @@ fn parse_shortflags<'c, 's>(
         }
     }
 
-    (leading_flags, takes_value_opt, short)
+    (leading_flags, takes_value_opt, short, all_known)
 }
 
 /// Parse the positional arguments. Return the new state and the new positional index.

@@ -1531,6 +1531,122 @@ pos-c
     );
 }
 
+#[test]
+fn suggest_option_value_forms_with_subcommand_alias() {
+    fn tool() -> Command {
+        Command::new("tool")
+            .disable_help_flag(true)
+            .disable_help_subcommand(true)
+            .subcommand(
+                Command::new("deploy")
+                    .alias("d")
+                    .arg(
+                        clap::Arg::new("format")
+                            .long("format")
+                            .short('f')
+                            .value_parser(["json", "yaml"]),
+                    )
+                    .arg(
+                        clap::Arg::new("profile")
+                            .long("profile")
+                            .action(clap::ArgAction::Append)
+                            .value_parser(["dev", "prod"]),
+                    )
+                    .arg(clap::Arg::new("target").value_parser(["all", "changed"])),
+            )
+    }
+
+    // The same value state must be presented consistently whether the value is
+    // separated, `=`-joined, or attached to a short flag, and whether the
+    // subcommand is referred to by name or by alias.
+    for subcommand in ["deploy", "d"] {
+        let mut cmd = tool();
+
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} --format [TAB]")),
+            snapbox::str![[r#"
+json
+yaml
+"#]],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} --format j[TAB]")),
+            snapbox::str!["json"],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} --format=[TAB]")),
+            snapbox::str![[r#"
+--format=json
+--format=yaml
+"#]],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} --format=j[TAB]")),
+            snapbox::str!["--format=json"],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} -f [TAB]")),
+            snapbox::str![[r#"
+json
+yaml
+"#]],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} -fj[TAB]")),
+            snapbox::str!["-fjson"],
+        );
+
+        // Repeating a repeatable option still completes its own values, not
+        // format values, option names, or subcommands.
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} --profile dev --profile [TAB]")),
+            snapbox::str![[r#"
+dev
+prod
+"#]],
+        );
+
+        // After `--`, only positional values are suggested.
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} -- [TAB]")),
+            snapbox::str![[r#"
+all
+changed
+"#]],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} --format json -- [TAB]")),
+            snapbox::str![[r#"
+all
+changed
+"#]],
+        );
+
+        // Unknown or invalid tokens complete to nothing rather than falling
+        // back to root command candidates.
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} --unknown[TAB]")),
+            snapbox::str![],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} --format xml[TAB]")),
+            snapbox::str![],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} --format=--[TAB]")),
+            snapbox::str![],
+        );
+        assert_data_eq!(
+            complete!(cmd, format!("{subcommand} -x[TAB]")),
+            snapbox::str![],
+        );
+    }
+
+    let mut cmd = tool();
+    assert_data_eq!(complete!(cmd, " [TAB]"), snapbox::str!["deploy"]);
+    assert_data_eq!(complete!(cmd, "unknown[TAB]"), snapbox::str![]);
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];
