@@ -83,7 +83,9 @@ pub fn complete(
             is_escaped = true;
         } else if opt_allows_hyphen(&current_state, &arg) {
             match current_state {
-                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                ParseState::Opt((opt, count, used)) => {
+                    next_state = parse_opt_value(opt, count, used);
+                }
                 _ => unreachable!("else branch is only reachable in Opt state"),
             }
         } else if let Some((flag, value)) = arg.to_long() {
@@ -100,8 +102,24 @@ pub fn complete(
 
                 if let Some(opt) = opt {
                     explicit_opts.insert(opt.get_id().clone());
-                    if opt.get_num_args().expect("built").takes_values() && value.is_none() {
-                        next_state = ParseState::Opt((opt, 1));
+                    if opt.get_num_args().expect("built").takes_values() {
+                        match value {
+                            None => next_state = ParseState::Opt((opt, 1, Vec::new())),
+                            Some(value) => {
+                                if let Some(delimiter) = multi_value_delimiter(opt) {
+                                    if let Some(value) = value.to_str() {
+                                        next_state = parse_delimited_value(
+                                            opt,
+                                            0,
+                                            Vec::new(),
+                                            value,
+                                            delimiter,
+                                            true,
+                                        )?;
+                                    }
+                                }
+                            }
+                        }
                     };
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
                     (next_state, pos_index) =
@@ -128,8 +146,25 @@ pub fn complete(
                 }
             }
             if let Some(opt) = takes_value_opt {
-                if short.next_value_os().is_none() {
-                    next_state = ParseState::Opt((opt, 1));
+                match short.next_value_os() {
+                    None => next_state = ParseState::Opt((opt, 1, Vec::new())),
+                    Some(value) => {
+                        if let Some(delimiter) = multi_value_delimiter(opt) {
+                            if let Some(value) = value.to_str() {
+                                // `-o=value` carries a leading `=`; strip it so
+                                // the value matches the long `--opt=value` form.
+                                let value = value.strip_prefix('=').unwrap_or(value);
+                                next_state = parse_delimited_value(
+                                    opt,
+                                    0,
+                                    Vec::new(),
+                                    value,
+                                    delimiter,
+                                    true,
+                                )?;
+                            }
+                        }
+                    }
                 }
             } else if pos_allows_hyphen(current_cmd, pos_index) {
                 (next_state, pos_index) =
@@ -141,12 +176,14 @@ pub fn complete(
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
-                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                ParseState::Opt((opt, count, used)) => {
+                    next_state = parse_opt_value_word(opt, count, used, &arg)?;
+                }
             }
         }
     }
 
-    Err(std::io::Error::other("no completion generated"))
+    Err(no_completion_error())
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -158,7 +195,12 @@ enum ParseState<'a> {
     Pos((usize, usize)),
 
     /// Parsing a optional flag argument
-    Opt((&'a clap::Arg, usize)),
+    ///
+    /// The `usize` is the 1-based index of the value being parsed within the
+    /// option's `num_args` range.  The `Vec` holds the values this occurrence
+    /// already consumed, so a delimiter-separated multi-value option does not
+    /// offer its earlier segments again.
+    Opt((&'a clap::Arg, usize, Vec<OsString>)),
 }
 
 fn complete_arg(
@@ -190,7 +232,7 @@ fn complete_arg(
             // option-name completion, and the word itself is not yet part of
             // the conflict set.
             if !is_escaped {
-                if let Some(values) = complete_inline_option_value(arg, cmd, current_dir, disabled)
+                if let Some(values) = complete_inline_option_value(arg, cmd, current_dir, disabled)?
                 {
                     completions.extend(values);
                     return finalize_completions(completions);
@@ -214,6 +256,7 @@ fn complete_arg(
                         positional,
                         current_dir,
                         0,
+                        &[],
                     ));
                 }
             }
@@ -232,6 +275,7 @@ fn complete_arg(
                         positional,
                         current_dir,
                         num_arg.saturating_sub(1),
+                        &[],
                     ));
                 }
                 if !is_escaped
@@ -243,13 +287,21 @@ fn complete_arg(
                 }
             }
         }
-        ParseState::Opt((opt, count)) => {
+        ParseState::Opt((opt, count, used)) => {
             if !disabled.contains(opt.get_id()) {
+                if let Some(delimiter) = multi_value_delimiter(opt) {
+                    // A hyphen-led word is another option, not this option's
+                    // value, unless the option accepts hyphen values.
+                    if opt.is_allow_hyphen_values_set() || !arg.to_value_os().starts_with("-") {
+                        validate_cursor_delimited(opt, arg.to_value(), count - 1, delimiter)?;
+                    }
+                }
                 completions.extend(complete_arg_value(
                     arg.to_value(),
                     opt,
                     current_dir,
                     count.saturating_sub(1),
+                    &used,
                 ));
             }
             let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
@@ -315,6 +367,12 @@ fn finalize_completions(
 /// part in option-name, subcommand or positional completion, and the word is
 /// not yet part of the conflict set.
 ///
+/// For a delimiter-separated multi-value option, the completed segments
+/// before the cursor are validated: an empty segment, an unknown value or
+/// more segments than the option accepts is rejected with the
+/// `no completion generated` error rather than silently completing a value
+/// the parser would refuse.
+///
 /// A bare `--name`/`-o` whose value is still a separate word completes
 /// normally, as does an unknown long name, a recognized option that takes no
 /// value and anything else that cannot be recognized: `None` preserves the
@@ -324,35 +382,48 @@ fn complete_inline_option_value(
     cmd: &clap::Command,
     current_dir: Option<&std::path::Path>,
     disabled: &HashSet<Id>,
-) -> Option<Vec<CompletionCandidate>> {
+) -> Result<Option<Vec<CompletionCandidate>>, std::io::Error> {
     if let Some((flag, value)) = arg.to_long() {
-        let flag = flag.ok()?;
+        let Ok(flag) = flag else {
+            return Ok(None);
+        };
         // A bare `--name` has no attached value and is completed as an option name.
-        let value = value?;
-        let opt = cmd.get_arguments().find(|a| {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let Some(opt) = cmd.get_arguments().find(|a| {
             a.get_long_and_visible_aliases()
                 .is_some_and(|longs| longs.into_iter().any(|long| long == flag))
-        })?;
+        }) else {
+            return Ok(None);
+        };
         if !opt.get_num_args().expect("built").takes_values() {
-            return None;
+            return Ok(None);
         }
         if disabled.contains(opt.get_id()) {
-            return Some(Vec::new());
+            return Ok(Some(Vec::new()));
         }
-        return Some(
-            complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0)
+        if let Some(delimiter) = multi_value_delimiter(opt) {
+            validate_cursor_delimited(opt, value.to_str().ok_or(value), 0, delimiter)?;
+        }
+        return Ok(Some(
+            complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0, &[])
                 .into_iter()
                 .map(|comp| comp.add_prefix(format!("--{flag}=")))
                 .collect(),
-        );
+        ));
     }
 
-    let short = arg.to_short()?;
+    let Some(short) = arg.to_short() else {
+        return Ok(None);
+    };
     if short.is_negative_number() {
-        return None;
+        return Ok(None);
     }
     let (leading_flags, opt, mut value_flags, _) = parse_shortflags(cmd, short);
-    let opt = opt?;
+    let Some(opt) = opt else {
+        return Ok(None);
+    };
 
     // Detect an attached value: once the cluster reaches its value-taking
     // flag, everything left is the value, optionally introduced by `=`.  With
@@ -361,7 +432,7 @@ fn complete_inline_option_value(
     let mut peek = value_flags.clone();
     let has_equal = matches!(peek.next_flag(), Some(Ok('=')));
     if !has_equal && value_flags.is_empty() {
-        return None;
+        return Ok(None);
     }
     if has_equal {
         // Consume the `=` so the remainder is the bare value (possibly empty
@@ -369,16 +440,19 @@ fn complete_inline_option_value(
         value_flags.next_flag();
     }
     if disabled.contains(opt.get_id()) {
-        return Some(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     let value = value_flags.next_value_os().unwrap_or(OsStr::new(""));
+    if let Some(delimiter) = multi_value_delimiter(opt) {
+        validate_cursor_delimited(opt, value.to_str().ok_or(value), 0, delimiter)?;
+    }
     let sep = if has_equal { "=" } else { "" };
-    Some(
-        complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0)
+    Ok(Some(
+        complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0, &[])
             .into_iter()
             .map(|comp| comp.add_prefix(format!("-{leading_flags}{sep}")))
             .collect(),
-    )
+    ))
 }
 
 fn complete_option(
@@ -432,9 +506,15 @@ fn complete_option(
                 if let Some(arg) = opt {
                     if !disabled.contains(arg.get_id()) {
                         completions.extend(
-                            complete_arg_value(value.to_str().ok_or(value), arg, current_dir, 0)
-                                .into_iter()
-                                .map(|comp| comp.add_prefix(format!("--{flag}="))),
+                            complete_arg_value(
+                                value.to_str().ok_or(value),
+                                arg,
+                                current_dir,
+                                0,
+                                &[],
+                            )
+                            .into_iter()
+                            .map(|comp| comp.add_prefix(format!("--{flag}="))),
                         );
                     }
                 }
@@ -469,7 +549,7 @@ fn complete_option(
 
                     let value = short.next_value_os().unwrap_or(OsStr::new(""));
                     completions.extend(
-                        complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0)
+                        complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0, &[])
                             .into_iter()
                             .map(|comp| {
                                 let sep = if has_equal { "=" } else { "" };
@@ -495,6 +575,7 @@ fn complete_arg_value(
     arg: &clap::Arg,
     current_dir: Option<&std::path::Path>,
     arg_index: usize,
+    used: &[OsString],
 ) -> Vec<CompletionCandidate> {
     let mut values = Vec::new();
     debug!("complete_arg_value: arg={arg:?}, value={value:?}, arg_index={arg_index:?}");
@@ -555,6 +636,12 @@ fn complete_arg_value(
         }
 
         values.sort();
+    }
+
+    if !used.is_empty() {
+        // Values earlier words of this occurrence already supplied must not
+        // be completed again.
+        values.retain(|comp| !used.iter().any(|u| u.as_os_str() == comp.get_value()));
     }
 
     if let Some(prefix) = prefix {
@@ -879,14 +966,135 @@ fn parse_positional<'a>(
 }
 
 /// Parse optional flag argument. Return new state
-fn parse_opt_value(opt: &clap::Arg, count: usize) -> ParseState<'_> {
+fn parse_opt_value(opt: &clap::Arg, count: usize, used: Vec<OsString>) -> ParseState<'_> {
     let range = opt.get_num_args().expect("built");
     let max = range.max_values();
     if count < max {
-        ParseState::Opt((opt, count + 1))
+        ParseState::Opt((opt, count + 1, used))
     } else {
         ParseState::ValueDone
     }
+}
+
+/// The value delimiter of an option whose values are tracked
+/// segment-by-segment across words.
+///
+/// Only options allowed more than one value get delimiter-aware state: with
+/// the default single-value `num_args`, a delimiter merely splits the one
+/// attached value and the historical in-word completion applies.
+fn multi_value_delimiter(opt: &clap::Arg) -> Option<char> {
+    let delimiter = opt.get_value_delimiter()?;
+    let max = opt.get_num_args().expect("built").max_values();
+    (max > 1).then_some(delimiter)
+}
+
+/// Parse a separate value word of `opt`'s current occurrence. Return new state
+fn parse_opt_value_word<'a>(
+    opt: &'a clap::Arg,
+    count: usize,
+    used: Vec<OsString>,
+    arg: &clap_lex::ParsedArg<'_>,
+) -> Result<ParseState<'a>, std::io::Error> {
+    if let Some(delimiter) = multi_value_delimiter(opt) {
+        if let Ok(value) = arg.to_value() {
+            return parse_delimited_value(opt, count - 1, used, value, delimiter, false);
+        }
+    }
+    Ok(parse_opt_value(opt, count, used))
+}
+
+/// Fold a closed delimiter-carrying value into the parse state of `opt`'s
+/// current occurrence.
+///
+/// `consumed` is how many values earlier words of this occurrence already
+/// supplied and `used` collects every completed segment so far.  `closes`
+/// reports whether a value without a trailing delimiter ends the occurrence:
+/// attached `--opt=value` / `-ovalue` forms close it, while separate value
+/// words stay open until `num_args` is satisfied.
+///
+/// A word that cannot belong to the option—an empty segment, a segment that
+/// is not one of the option's possible values, more segments than the option
+/// accepts, or a trailing delimiter with no room for the value it
+/// introduces—is rejected with the `no completion generated` error rather
+/// than silently accepted.
+fn parse_delimited_value<'a>(
+    opt: &'a clap::Arg,
+    consumed: usize,
+    mut used: Vec<OsString>,
+    value: &str,
+    delimiter: char,
+    closes: bool,
+) -> Result<ParseState<'a>, std::io::Error> {
+    let max = opt.get_num_args().expect("built").max_values();
+    let trailing = value.ends_with(delimiter);
+    let segments: Vec<&str> = value.split(delimiter).collect();
+    // With a trailing delimiter, the final empty segment is the pending one
+    // the next word continues; every segment before it is completed.
+    let completed = if trailing {
+        &segments[..segments.len() - 1]
+    } else {
+        &segments[..]
+    };
+    for segment in completed {
+        if segment.is_empty() || is_unknown_value(opt, segment) {
+            return Err(no_completion_error());
+        }
+    }
+    let consumed = consumed + completed.len();
+    if consumed > max || (trailing && consumed == max) {
+        return Err(no_completion_error());
+    }
+    used.extend(completed.iter().map(OsString::from));
+    if !trailing && (closes || consumed == max) {
+        Ok(ParseState::ValueDone)
+    } else {
+        Ok(ParseState::Opt((opt, consumed + 1, used)))
+    }
+}
+
+/// Validate the completed segments of a delimiter-carrying cursor value.
+///
+/// `consumed` is how many values earlier words of this occurrence already
+/// supplied.  An empty or unknown completed segment, or a segment under the
+/// cursor that would exceed the option's value limit, produces no candidates;
+/// the word fails with the `no completion generated` error instead of
+/// fabricating candidates the parser would refuse.
+fn validate_cursor_delimited(
+    opt: &clap::Arg,
+    value: Result<&str, &OsStr>,
+    consumed: usize,
+    delimiter: char,
+) -> Result<(), std::io::Error> {
+    let Ok(value) = value else {
+        return Ok(());
+    };
+    let max = opt.get_num_args().expect("built").max_values();
+    let segments: Vec<&str> = value.split(delimiter).collect();
+    // The last segment is the one under the cursor; everything before it is
+    // completed and must be valid on its own.
+    let completed = &segments[..segments.len() - 1];
+    for segment in completed {
+        if segment.is_empty() || is_unknown_value(opt, segment) {
+            return Err(no_completion_error());
+        }
+    }
+    if consumed + completed.len() >= max {
+        return Err(no_completion_error());
+    }
+    Ok(())
+}
+
+/// Whether `opt` has a fixed set of possible values and `segment` is not one
+/// of them.  Anything else (free-form values, custom completers) is accepted.
+fn is_unknown_value(opt: &clap::Arg, segment: &str) -> bool {
+    match possible_values(opt) {
+        Some(mut possible) => !possible.any(|p| p.get_name() == segment),
+        None => false,
+    }
+}
+
+fn no_completion_error() -> std::io::Error {
+    std::io::Error::other("no completion generated")
 }
 
 fn pos_allows_hyphen(cmd: &clap::Command, pos_index: usize) -> bool {
@@ -899,7 +1107,7 @@ fn pos_allows_hyphen(cmd: &clap::Command, pos_index: usize) -> bool {
 fn opt_allows_hyphen(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> bool {
     let val = arg.to_value_os();
     if val.starts_with("-") {
-        if let ParseState::Opt((opt, _)) = state {
+        if let ParseState::Opt((opt, ..)) = state {
             return opt.is_allow_hyphen_values_set();
         }
     }
