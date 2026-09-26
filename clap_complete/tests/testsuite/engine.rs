@@ -111,6 +111,95 @@ hello-moon
     );
 }
 
+fn aliased_tool_command() -> Command {
+    Command::new("tool").subcommand(
+        Command::new("remote").visible_alias("r").subcommand(
+            Command::new("show")
+                .visible_alias("s")
+                .arg(
+                    clap::Arg::new("format")
+                        .long("format")
+                        .value_parser(["json", "yaml"]),
+                )
+                .arg(clap::Arg::new("target").value_parser(["all", "changed"])),
+        ),
+    )
+}
+
+#[test]
+fn suggest_option_values_after_subcommand_aliases() {
+    let mut cmd = aliased_tool_command();
+
+    assert_data_eq!(
+        complete!(cmd, "remote show --format "),
+        snapbox::str![[r#"
+json
+yaml
+"#]],
+    );
+    assert_data_eq!(
+        complete!(cmd, "r show --format "),
+        snapbox::str![[r#"
+json
+yaml
+"#]],
+    );
+    assert_data_eq!(
+        complete!(cmd, "remote s --format "),
+        snapbox::str![[r#"
+json
+yaml
+"#]],
+    );
+    assert_data_eq!(
+        complete!(cmd, "r s --format "),
+        snapbox::str![[r#"
+json
+yaml
+"#]],
+    );
+
+    assert_data_eq!(complete!(cmd, "r s --format j"), snapbox::str!["json"]);
+
+    assert_data_eq!(complete!(cmd, "r s --format z"), snapbox::str![""]);
+
+    assert_data_eq!(complete!(cmd, "rx"), snapbox::str![""]);
+}
+
+#[test]
+fn suggest_positional_values_after_escape_with_subcommand_aliases() {
+    let mut cmd = aliased_tool_command();
+
+    assert_data_eq!(
+        complete!(cmd, "remote show -- "),
+        snapbox::str![[r#"
+all
+changed
+"#]],
+    );
+    assert_data_eq!(
+        complete!(cmd, "r s -- "),
+        snapbox::str![[r#"
+all
+changed
+"#]],
+    );
+
+    assert_data_eq!(complete!(cmd, "r s -- a"), snapbox::str!["all"]);
+
+    assert_data_eq!(complete!(cmd, "r s -- --format"), snapbox::str![""]);
+
+    // A partially typed alias must not switch to the aliased command path
+    assert_data_eq!(
+        complete!(cmd, "re s --format "),
+        snapbox::str![[r#"
+r
+help	Print this message or the help of the given subcommand(s)
+--help	Print help
+"#]],
+    );
+}
+
 #[test]
 fn suggest_hidden_possible_value() {
     let mut cmd = Command::new("exhaustive").arg(
