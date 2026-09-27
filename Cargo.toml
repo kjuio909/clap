@@ -556,5 +556,10 @@ path = "examples/derive_ref/flatten_hand_args.rs"
 required-features = ["derive"]
 doc-scrape-examples = true
 
+[[test]]
+name = "task015"
+path = "tests/task015.rs"
+required-features = ["derive", "help", "usage"]
+
 [lints]
 workspace = true
