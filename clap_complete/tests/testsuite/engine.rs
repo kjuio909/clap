@@ -1608,6 +1608,362 @@ dst
     );
 }
 
+/// Build the command from the task spec: a two-value comma-delimited
+/// `--format` (visible alias + short) with both a default and an env source,
+/// a conflicting `--raw` (visible alias + short) and a directory positional.
+fn spec_command() -> Command {
+    Command::new("fmt")
+        .arg(
+            clap::Arg::new("format")
+                .long("format")
+                .visible_alias("fmt-kind")
+                .short('f')
+                .num_args(1..=2)
+                .value_parser(["json", "yaml"])
+                .value_delimiter(',')
+                .default_value("json")
+                .env("FMT_FORMAT_VALUE"),
+        )
+        .arg(
+            clap::Arg::new("raw")
+                .long("raw")
+                .visible_alias("unformatted")
+                .short('r')
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("format"),
+        )
+        .arg(clap::Arg::new("dir").value_hint(clap::ValueHint::DirPath))
+}
+
+fn spec_tempdir() -> snapbox::dir::DirRoot {
+    let testdir = snapbox::dir::DirRoot::mutable_temp().unwrap();
+    let path = testdir.path().unwrap();
+    fs::create_dir_all(path.join("a_dir/nested")).unwrap();
+    fs::create_dir_all(path.join("b_dir")).unwrap();
+    fs::write(path.join("a_file"), "").unwrap();
+    testdir
+}
+
+#[test]
+fn suggest_implicit_sources_do_not_select_format() {
+    // Neither the default value nor the env value is a user choice; an empty
+    // word must still offer `format` (canonical name, visible alias, short),
+    // `raw` (canonical name, visible alias, short) and help.
+    assert_data_eq!(
+        complete!(spec_command(), " [TAB]"),
+        snapbox::str![[r#"
+--format
+--raw
+--help	Print help
+"#]]
+    );
+
+    // The same with an env value available: implicit sources never suppress.
+    // SAFETY: this variable is unique to this test and the completion engine
+    // never reads the environment, so nothing can observe a racy value.
+    unsafe {
+        std::env::set_var("FMT_FORMAT_VALUE", "json");
+    }
+    assert_data_eq!(
+        complete!(spec_command(), " [TAB]"),
+        snapbox::str![[r#"
+--format
+--raw
+--help	Print help
+"#]]
+    );
+
+    // Prefix completion surfaces the visible aliases too.
+    assert_data_eq!(
+        complete!(spec_command(), "--fmt[TAB]"),
+        snapbox::str!["--fmt-kind"]
+    );
+    assert_data_eq!(
+        complete!(spec_command(), "--unf[TAB]"),
+        snapbox::str!["--unformatted"]
+    );
+    assert_data_eq!(
+        complete!(spec_command(), "-[TAB]"),
+        snapbox::str![[r#"
+-f	--format
+-r	--raw
+-h	Print help
+"#]]
+    );
+}
+
+#[test]
+fn suggest_explicit_format_conflicts_consistently() {
+    // Every spelling of an explicit `format` establishes the same conflict:
+    // the second segment is offered while open; after the occurrence closes
+    // `format` stays but `raw` (name, visible alias and short) is suppressed.
+    for input in ["--format json, [TAB]", "--fmt-kind json, [TAB]", "-f json, [TAB]"] {
+        assert_data_eq!(
+            complete!(spec_command(), input),
+            snapbox::str![[r#"
+yaml
+"#]]
+        );
+    }
+
+    assert_data_eq!(
+        complete!(spec_command(), "--format=json,yaml [TAB]"),
+        snapbox::str![[r#"
+--format
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(spec_command(), "--fmt-kind=json,yaml [TAB]"),
+        snapbox::str![[r#"
+--format
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(spec_command(), "-fjson,yaml [TAB]"),
+        snapbox::str![[r#"
+--format
+--help	Print help
+"#]]
+    );
+
+    // The conflicting long and alias candidates stay hidden under every
+    // spelling.
+    for input in [
+        "--format json,yaml --r[TAB]",
+        "--fmt-kind=json,yaml --unf[TAB]",
+    ] {
+        assert_data_eq!(complete!(spec_command(), input), snapbox::str![""]);
+    }
+    // A short prefix keeps the typed cluster and offers the still-visible
+    // flags behind it (the same existing semantics as any conflict).
+    assert_data_eq!(
+        complete!(spec_command(), "-fjson,yaml -r[TAB]"),
+        snapbox::str![[r#"
+-rf	--format
+-rh	Print help
+"#]]
+    );
+
+    // Already selected value does not reappear; the editing segment filters on
+    // its own prefix only.
+    assert_data_eq!(complete!(spec_command(), "--format=json,j[TAB]"), snapbox::str![""]);
+    assert_data_eq!(
+        complete!(spec_command(), "--format=json,y[TAB]"),
+        snapbox::str!["--format=json,yaml"]
+    );
+
+    // Reverse direction: an explicit `raw` suppresses `format`.
+    for input in ["--raw [TAB]", "--unformatted [TAB]", "-r [TAB]"] {
+        assert_data_eq!(
+            complete!(spec_command(), input),
+            snapbox::str![[r#"
+--raw
+--help	Print help
+"#]]
+        );
+    }
+}
+
+#[test]
+fn suggest_only_directory_positionals_after_escape() {
+    let testdir = spec_tempdir();
+    let path = testdir.path().unwrap();
+
+    // Conflict state established before `--` survives, but the output contains
+    // only the directory positional's candidates (read from current_dir).
+    assert_data_eq!(
+        complete!(spec_command(), "--format json,yaml -- [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+"#]]
+    );
+    assert_data_eq!(
+        complete!(spec_command(), "-fjson,yaml -- [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+"#]]
+    );
+
+    // Path prefix rules: partial name, an entered directory and `.`.
+    assert_data_eq!(
+        complete!(spec_command(), "--format json -- a[TAB]", current_dir = Some(path)),
+        snapbox::str!["a_dir/"]
+    );
+    assert_data_eq!(
+        complete!(spec_command(), "--format json -- a_dir/[TAB]", current_dir = Some(path)),
+        snapbox::str!["a_dir/nested/"]
+    );
+    assert_data_eq!(
+        complete!(spec_command(), "--format json -- .[TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+./a_dir/
+./b_dir/
+"#]]
+    );
+
+    // No option, alias or option value leaks after `--`.
+    assert_data_eq!(
+        complete!(spec_command(), "--format json -- --r[TAB]", current_dir = Some(path)),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(spec_command(), "--format json -- --fmt[TAB]", current_dir = Some(path)),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(spec_command(), "--raw -- [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+"#]]
+    );
+}
+
+#[test]
+fn suggest_dedups_same_insertion_across_sources() {
+    // A subcommand and a positional possible value propose the same text; the
+    // literal insertion appears once regardless of the source/order.
+    let mut cmd = Command::new("fmt")
+        .subcommand(Command::new("src"))
+        .arg(clap::Arg::new("dir").value_parser(["src", "dst"]));
+
+    assert_data_eq!(
+        complete!(cmd, " [TAB]"),
+        snapbox::str![[r#"
+src
+help	Print this message or the help of the given subcommand(s)
+dst
+--help	Print help
+"#]]
+    );
+
+    // A path candidate with the same insertion text as a subcommand candidate
+    // is kept once as well (here an `AnyPath` entry named like a subcommand).
+    let testdir = snapbox::dir::DirRoot::mutable_temp().unwrap();
+    let path = testdir.path().unwrap();
+    fs::write(path.join("dup"), "").unwrap();
+    fs::write(path.join("other"), "").unwrap();
+    let mut cmd = Command::new("fmt")
+        .subcommand(Command::new("dup"))
+        .arg(clap::Arg::new("path").value_hint(clap::ValueHint::AnyPath));
+    assert_data_eq!(
+        complete!(cmd, " [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+dup
+help	Print this message or the help of the given subcommand(s)
+.
+other
+--help	Print help
+"#]]
+    );
+}
+
+#[test]
+fn complete_first_word_respects_binary_name_setting() {
+    let testdir = spec_tempdir();
+    let path = testdir.path().unwrap();
+
+    // Default with a program name: args[0] is skipped, never mistaken for an
+    // argument or the positional's value, so the positional's directory
+    // candidates are still offered and nothing is suppressed.
+    let mut cmd = spec_command();
+    let completions = complete_values(&mut cmd, vec!["fmt".into(), "".into()], 1, Some(path));
+    assert_eq!(
+        completions,
+        vec![
+            ".".to_owned(),
+            "a_dir/".to_owned(),
+            "b_dir/".to_owned(),
+            "--format".to_owned(),
+            "--raw".to_owned(),
+            "--help".to_owned(),
+        ]
+    );
+
+    // no_binary_name(true) with the same word sequence: `fmt` is parsed as
+    // the positional's value, leaving no positional to complete.
+    let mut cmd = spec_command().no_binary_name(true);
+    let completions = complete_values(&mut cmd, vec!["fmt".into(), "".into()], 1, Some(path));
+    assert_eq!(
+        completions,
+        vec!["--format".to_owned(), "--raw".to_owned(), "--help".to_owned()]
+    );
+
+    // no_binary_name(true) without a program name: an option in first
+    // position records state from the very first word, so `--format json`
+    // selects format and suppresses raw.
+    let mut cmd = spec_command().no_binary_name(true);
+    let completions = complete_values(
+        &mut cmd,
+        vec!["--format".into(), "json".into(), "".into()],
+        2,
+        None,
+    );
+    assert!(completions.contains(&"yaml".to_owned()));
+    assert!(completions.contains(&"--format".to_owned()));
+    assert!(!completions.contains(&"--raw".to_owned()));
+
+    // Default without a program name: `--format` itself is skipped as the
+    // binary name, so nothing is recorded and `raw` stays available.
+    let mut cmd = spec_command();
+    let completions = complete_values(
+        &mut cmd,
+        vec!["--format".into(), "json".into(), "".into()],
+        2,
+        None,
+    );
+    assert!(completions.contains(&"--format".to_owned()));
+    assert!(completions.contains(&"--raw".to_owned()));
+}
+
+#[test]
+fn suggest_spec_illegal_forms_error() {
+    // Unknown values, empty segments, a third segment and illegal `=` forms
+    // keep reporting the existing error rather than guessing a candidate from
+    // the default, the env value or the word being edited.
+    for input in [
+        "--format=junk [TAB]",
+        "--format junk [TAB]",
+        "--format=json,,y[TAB]",
+        "--format=json,yaml, [TAB]",
+        "--format=json,yaml,toml [TAB]",
+        "--format=json= [TAB]",
+        "--format=json, -- [TAB]",
+    ] {
+        assert_eq!(complete_err(&mut spec_command(), input), "no completion generated");
+    }
+
+    // A closed `--raw=x` word keeps the existing flag-recording semantics:
+    // `raw` is present, so `format` stays suppressed (it is not an error).
+    assert_data_eq!(
+        complete!(spec_command(), "--raw=x [TAB]"),
+        snapbox::str![[r#"
+--raw
+--help	Print help
+"#]]
+    );
+}
+
+fn complete_values(
+    cmd: &mut Command,
+    args: Vec<std::ffi::OsString>,
+    arg_index: usize,
+    current_dir: Option<&Path>,
+) -> Vec<String> {
+    clap_complete::engine::complete(cmd, args, arg_index, current_dir)
+        .unwrap()
+        .into_iter()
+        .map(|c| c.get_value().to_str().unwrap().to_owned())
+        .collect()
+}
+
 fn complete_err(cmd: &mut Command, args: impl AsRef<str>) -> String {
     let input = args.as_ref();
     let mut raw = vec![std::ffi::OsString::from(cmd.get_name())];

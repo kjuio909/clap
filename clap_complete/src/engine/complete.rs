@@ -588,6 +588,13 @@ fn finalize_completions(
             true
         }
     });
+    // Different sources (a subcommand and a positional value, an option alias
+    // and a directory entry, ...) can propose the same literal insertion text
+    // under different ids; only the first is kept.  Retaining by first
+    // occurrence keeps the presentation order untouched by aliases or
+    // duplicate directory entries.
+    let mut seen_values = HashSet::new();
+    completions.retain(move |a| seen_values.insert(a.get_value().to_os_string()));
 
     let mut tags = Vec::new();
     for candidate in &completions {
