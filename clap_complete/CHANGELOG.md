@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Features
 
 - *(dynamic)* Hide completion candidates that conflict with options already present on the command line
+- *(dynamic)* Honor an option's `value_terminator` as a standalone word that ends value taking, restoring ordinary option and positional completion (but not conflicting options), across the canonical name, visible alias, short and `=`/space-separated spellings; a terminator glued to other text, repeated, or placed at an invalid value position produces no completion
 
 ### Fixes
 

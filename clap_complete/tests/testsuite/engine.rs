@@ -1608,6 +1608,295 @@ dst
     );
 }
 
+/// Build the command from the terminator spec: a `--tag` option (visible
+/// alias `--label` and short `-t`) with at most three comma-delimited values
+/// chosen from a fixed set and the standalone terminator `;`; a valueless
+/// `--raw` that conflicts with it; and a positional that accepts `src`/`dst`.
+fn terminator_base() -> Command {
+    Command::new("tag")
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .visible_alias("label")
+                .short('t')
+                .num_args(1..=3)
+                .value_parser(["red", "green", "blue"])
+                .value_delimiter(',')
+                .value_terminator(";"),
+        )
+        .arg(
+            clap::Arg::new("raw")
+                .long("raw")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("tag"),
+        )
+}
+
+fn terminator_command() -> Command {
+    terminator_base().arg(clap::Arg::new("path").value_parser(["src", "dst"]))
+}
+
+/// Like [`terminator_command`] but its positional also completes the
+/// directories of `dir` in addition to `src`/`dst`.
+fn terminator_dir_command(dir: std::path::PathBuf) -> Command {
+    use clap_complete::engine::ValueCompleter as _;
+    terminator_base().arg(
+        clap::Arg::new("path").add(ArgValueCompleter::new(move |current: &std::ffi::OsStr| {
+            let prefix = current.to_string_lossy();
+            let mut values: Vec<CompletionCandidate> = ["src", "dst"]
+                .into_iter()
+                .map(CompletionCandidate::new)
+                .filter(|candidate| {
+                    candidate
+                        .get_value()
+                        .to_string_lossy()
+                        .starts_with(&*prefix)
+                })
+                .collect();
+            values.extend(
+                PathCompleter::dir()
+                    .current_dir(dir.clone())
+                    .complete(current),
+            );
+            values
+        })),
+    )
+}
+
+#[test]
+fn suggest_tag_terminator_open_segment() {
+    // A closed dangling-comma word, reached through every spelling, keeps
+    // accepting only the unused values on the next empty word. `red` is
+    // already selected and must not reappear, and no option name or
+    // positional leaks into the mandatory segment position.
+    for input in [
+        "--tag=red, [TAB]",
+        "--label=red, [TAB]",
+        "-tred, [TAB]",
+        "-t=red, [TAB]",
+        "--tag red, [TAB]",
+    ] {
+        assert_data_eq!(
+            complete!(terminator_command(), input),
+            snapbox::str![[r#"
+green
+blue
+"#]]
+        );
+    }
+
+    // Editing the word with the cursor filters only the segment being typed
+    // and keeps the spelling the caller used.
+    assert_data_eq!(
+        complete!(terminator_command(), "--tag=red,g[TAB]"),
+        snapbox::str!["--tag=red,green"]
+    );
+    assert_data_eq!(
+        complete!(terminator_command(), "--label=red,b[TAB]"),
+        snapbox::str!["--label=red,blue"]
+    );
+    assert_data_eq!(
+        complete!(terminator_command(), "-tred,b[TAB]"),
+        snapbox::str!["-tred,blue"]
+    );
+    assert_data_eq!(
+        complete!(terminator_command(), "-t=red,b[TAB]"),
+        snapbox::str!["-t=red,blue"]
+    );
+    assert_data_eq!(
+        complete!(terminator_command(), "--tag red, g[TAB]"),
+        snapbox::str!["green"]
+    );
+
+    // An already closed value is never offered again, even while editing.
+    assert_data_eq!(complete!(terminator_command(), "--tag=red,r[TAB]"), snapbox::str![""]);
+
+    // Separate value words establish the same selected state.
+    assert_data_eq!(
+        complete!(terminator_command(), "--tag red green, [TAB]"),
+        snapbox::str!["blue"]
+    );
+    assert_data_eq!(
+        complete!(terminator_command(), "--tag red green, b[TAB]"),
+        snapbox::str!["blue"]
+    );
+}
+
+#[test]
+fn suggest_tag_terminator_restores_parsing() {
+    // Once the standalone `;` is consumed, the next empty word ends tag value
+    // taking and restores ordinary options and positionals, while `raw`
+    // (conflicting with the explicitly selected tag) stays suppressed. The
+    // terminator itself is never offered.
+    let after = snapbox::str![[r#"
+src
+dst
+--tag
+--help	Print help
+"#]];
+    for input in [
+        "--tag red ; [TAB]",
+        "--tag=red ; [TAB]",
+        "--label red ; [TAB]",
+        "-tred ; [TAB]",
+        "--tag red,green ; [TAB]",
+        "--tag=red,green ; [TAB]",
+        "--tag red green ; [TAB]",
+        "--tag red,green,blue ; [TAB]",
+        "--tag=red,green,blue ; [TAB]",
+    ] {
+        assert_data_eq!(complete!(terminator_command(), input), after.clone());
+    }
+
+    // The word carrying the terminator itself offers nothing.
+    assert_data_eq!(complete!(terminator_command(), "--tag red ;[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(terminator_command(), "--tag=red ;[TAB]"), snapbox::str![""]);
+
+    // The conflicting raw option stays hidden under every prefix, while the
+    // non-conflicting option and help remain available.
+    assert_data_eq!(complete!(terminator_command(), "--tag red ; --r[TAB]"), snapbox::str![""]);
+    assert_data_eq!(
+        complete!(terminator_command(), "--tag red ; --raw[TAB]"),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(terminator_command(), "--tag red ; --t[TAB]"),
+        snapbox::str!["--tag"]
+    );
+
+    // A positional filled after the terminator completes normally.
+    assert_data_eq!(
+        complete!(terminator_command(), "--tag red ; s[TAB]"),
+        snapbox::str!["src"]
+    );
+}
+
+#[test]
+fn suggest_tag_terminator_then_escape() {
+    let testdir = snapbox::dir::DirRoot::mutable_temp().unwrap();
+    let path = testdir.path().unwrap();
+    fs::create_dir_all(path.join("a_dir/nested")).unwrap();
+    fs::create_dir_all(path.join("b_dir")).unwrap();
+    fs::write(path.join("a_file"), "").unwrap();
+
+    // After the terminator, `--` leaves only the positional: its fixed
+    // `src`/`dst` values and the directories of the current directory, in the
+    // established order. Options never leak.
+    assert_data_eq!(
+        complete!(
+            terminator_dir_command(path.to_owned()),
+            "--tag red ; -- [TAB]",
+            current_dir = Some(path)
+        ),
+        snapbox::str![[r#"
+src
+dst
+.
+a_dir/
+b_dir/
+"#]]
+    );
+    assert_data_eq!(
+        complete!(
+            terminator_dir_command(path.to_owned()),
+            "--tag=red,green,blue ; -- s[TAB]",
+            current_dir = Some(path)
+        ),
+        snapbox::str!["src"]
+    );
+    assert_data_eq!(
+        complete!(
+            terminator_dir_command(path.to_owned()),
+            "--label red ; -- a[TAB]",
+            current_dir = Some(path)
+        ),
+        snapbox::str!["a_dir/"]
+    );
+    assert_data_eq!(
+        complete!(
+            terminator_dir_command(path.to_owned()),
+            "-tred ; -- .[TAB]",
+            current_dir = Some(path)
+        ),
+        snapbox::str![[r#"
+./a_dir/
+./b_dir/
+"#]]
+    );
+
+    // Even without the directory completer, `--` after the terminator offers
+    // just the fixed positional values.
+    assert_data_eq!(
+        complete!(terminator_command(), "--tag red ; -- [TAB]"),
+        snapbox::str![[r#"
+src
+dst
+"#]]
+    );
+}
+
+#[test]
+fn suggest_tag_terminator_illegal_forms_error() {
+    // The terminator cannot close a dangling segment that still owes a value.
+    for input in [
+        "--tag=red, ; [TAB]",
+        "--tag red, ; [TAB]",
+        "--tag=red, ;[TAB]",
+    ] {
+        assert_eq!(
+            complete_err(&mut terminator_command(), input),
+            "no completion generated"
+        );
+    }
+
+    // The terminator cannot arrive before the minimum number of value words.
+    assert_eq!(
+        complete_err(&mut terminator_command(), "--tag ; [TAB]"),
+        "no completion generated"
+    );
+
+    // A terminator glued onto other text is never split into value plus
+    // terminator, whether attached or separate.
+    for input in [
+        "--tag red ;x [TAB]",
+        "--tag red x; [TAB]",
+        "--tag=red; [TAB]",
+        "--tag=red;[TAB]",
+        "--tag=; [TAB]",
+        "--tag=;x [TAB]",
+        "-tred; [TAB]",
+    ] {
+        assert_eq!(
+            complete_err(&mut terminator_command(), input),
+            "no completion generated"
+        );
+    }
+
+    // A second terminator closes no further value.
+    for input in ["--tag red ; ; [TAB]", "--tag red ; ;[TAB]"] {
+        assert_eq!(
+            complete_err(&mut terminator_command(), input),
+            "no completion generated"
+        );
+    }
+
+    // Unknown closed values and a fourth segment (empty segment, overfull)
+    // keep reporting the existing error.
+    for input in [
+        "--tag purple ; [TAB]",
+        "--tag=purple ; [TAB]",
+        "--tag=red,green,blue, [TAB]",
+        "--tag=red,green,blue,extra [TAB]",
+        "--tag=red,,g[TAB]",
+        "--tag=red,, [TAB]",
+    ] {
+        assert_eq!(
+            complete_err(&mut terminator_command(), input),
+            "no completion generated"
+        );
+    }
+}
+
 /// Build the command from the task spec: a two-value comma-delimited
 /// `--format` (visible alias + short) with both a default and an env source,
 /// a conflicting `--raw` (visible alias + short) and a directory positional.

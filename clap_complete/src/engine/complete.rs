@@ -43,6 +43,11 @@ pub fn complete(
     let mut pos_index = 1;
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
+    // Text of the value terminator carried by the option whose terminator was
+    // consumed as the previous closed word. It only lives for one word: a second
+    // terminator is a duplicate (and therefore illegal) while any other word
+    // resumes normal parsing.
+    let mut last_terminator: Option<OsString> = None;
     // Set when an already closed word carried a value that cannot be part of
     // the command line (a delimiter-separated value set that is overfull, has
     // an empty segment, ...). Completion then reports "no completion generated"
@@ -64,6 +69,14 @@ pub fn complete(
             if is_illegal {
                 return Err(std::io::Error::other("no completion generated"));
             }
+            // A terminator typed immediately after the standalone terminator
+            // would be a second one; it closes no value and cannot complete.
+            if last_terminator
+                .as_deref()
+                .is_some_and(|term| word_is(term, &arg))
+            {
+                return Err(std::io::Error::other("no completion generated"));
+            }
             let disabled = gather_disabled_args(current_cmd, &explicit_opts);
             return complete_arg(
                 &arg,
@@ -76,6 +89,15 @@ pub fn complete(
             );
         }
 
+        // The terminator that ended the previous closed word, repeated here,
+        // cannot close the occurrence a second time.
+        let duplicate_terminator = last_terminator
+            .as_deref()
+            .is_some_and(|term| word_is(term, &arg));
+        if duplicate_terminator {
+            is_illegal = true;
+        }
+
         if let Ok(value) = arg.to_value() {
             // A dangling delimiter forces this word to be the option's next
             // segment, never a subcommand.
@@ -84,7 +106,27 @@ pub fn complete(
                 if let Some(next_cmd) = current_cmd.find_subcommand(value) {
                     current_cmd = next_cmd;
                     pos_index = 1;
+                    last_terminator = None;
                     continue;
+                }
+            }
+        }
+
+        // A standalone terminator word ends the option's value taking; it is
+        // neither a value nor a candidate. It cannot arrive while a dangling
+        // delimiter still expects a segment, before the option's minimum number
+        // of value words is present, or after an earlier illegal word.
+        let mut consumed_terminator: Option<OsString> = None;
+        if let ParseState::Opt(state) = &current_state {
+            if let Some(terminator) = state.opt.get_value_terminator() {
+                if word_is(OsStr::new(terminator.as_str()), &arg) {
+                    let min = state.opt.get_num_args().expect("built").min_values();
+                    let consumed_words = state.word.saturating_sub(1);
+                    if state.open || consumed_words < min || is_illegal {
+                        is_illegal = true;
+                    } else {
+                        consumed_terminator = Some(OsString::from(terminator.as_str()));
+                    }
                 }
             }
         }
@@ -109,13 +151,27 @@ pub fn complete(
             }
         }
 
+        // Once the value occurrence is complete, only the standalone terminator
+        // still belongs to it; any other word resumes ordinary option/positional
+        // parsing. This one-word window makes the terminator work identically
+        // across `=`, separate words, shorts and aliases.
+        let dispatch_state = if matches!(&current_state, ParseState::Opt(state) if state.closed)
+            && consumed_terminator.is_none()
+        {
+            ParseState::ValueDone
+        } else {
+            current_state
+        };
+
         if is_escaped {
             (next_state, pos_index) =
-                parse_positional(current_cmd, pos_index, is_escaped, current_state);
+                parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
         } else if arg.is_escape() {
             is_escaped = true;
-        } else if opt_allows_hyphen(&current_state, &arg) {
-            match current_state {
+        } else if consumed_terminator.is_some() {
+            next_state = ParseState::ValueDone;
+        } else if opt_allows_hyphen(&dispatch_state, &arg) {
+            match dispatch_state {
                 ParseState::Opt(state) => {
                     next_state = advance_opt_value(state, arg.to_value_os(), &mut is_illegal);
                 }
@@ -149,7 +205,7 @@ pub fn complete(
                     }
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
                     (next_state, pos_index) =
-                        parse_positional(current_cmd, pos_index, is_escaped, current_state);
+                        parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
                 }
             }
         } else if let Some(short) = arg.to_short() {
@@ -182,19 +238,24 @@ pub fn complete(
                 }
             } else if pos_allows_hyphen(current_cmd, pos_index) {
                 (next_state, pos_index) =
-                    parse_positional(current_cmd, pos_index, is_escaped, current_state);
+                    parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
             }
         } else {
-            match current_state {
+            match dispatch_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
                     (next_state, pos_index) =
-                        parse_positional(current_cmd, pos_index, is_escaped, current_state);
+                        parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
                 }
                 ParseState::Opt(state) => {
                     next_state = advance_opt_value(state, arg.to_value_os(), &mut is_illegal);
                 }
             }
         }
+
+        // Remember a just-consumed terminator for exactly one word so a
+        // repeated terminator is flagged as a duplicate; every other word
+        // clears it and resumes ordinary parsing.
+        last_terminator = consumed_terminator;
     }
 
     Err(std::io::Error::other("no completion generated"))
@@ -226,6 +287,12 @@ struct OptState<'a> {
     /// The state was reached through a dangling value delimiter, so the next
     /// word is another segment of this option rather than an optional stop.
     open: bool,
+    /// The value occurrence itself is complete (an attached word or a full
+    /// delimiter set), so ordinary parsing resumes, but the option's standalone
+    /// terminator may still arrive as the very next word. This makes the
+    /// terminator work identically whether values arrived through `=`, a
+    /// separate word, a short flag or an alias.
+    closed: bool,
 }
 
 impl<'a> OptState<'a> {
@@ -235,6 +302,7 @@ impl<'a> OptState<'a> {
             word,
             used: Vec::new(),
             open: false,
+            closed: false,
         }
     }
 }
@@ -253,6 +321,14 @@ fn is_bounded_delimited(opt: &clap::Arg) -> Option<char> {
     } else {
         None
     }
+}
+
+/// Whether a terminator glued into a value word is structurally impossible for
+/// this option. clap rejects such a word when the option packs a bounded,
+/// delimiter-separated set from fixed possible values (a segment like `;x` can
+/// never name a value), while a free-form option simply takes the whole word.
+fn glued_terminator_is_illegal(opt: &clap::Arg) -> bool {
+    is_bounded_delimited(opt).is_some() && possible_values(opt).is_some()
 }
 
 /// Split a shell value on its delimiter into its closed segments.
@@ -299,6 +375,7 @@ fn consume_opt_word<'a>(
                 word: ordinal + 1,
                 used,
                 open: false,
+                closed: false,
             })
         } else {
             None
@@ -328,16 +405,30 @@ fn consume_opt_word<'a>(
     // still accepts another segment; a space-separated word keeps accepting
     // values until the range is full.
     let accepts_more = dangling || (!attached && closed < max);
-    Ok(if accepts_more {
-        Some(OptState {
+    if accepts_more {
+        Ok(Some(OptState {
             opt,
             word: ordinal + 1,
             used,
             open: dangling,
-        })
+            closed: false,
+        }))
+    } else if opt.get_value_terminator().is_some() {
+        // The value occurrence is complete, but an argument with a value
+        // terminator still accepts the standalone terminator as the very next
+        // word, no matter whether the values arrived through `=`, a separate
+        // word, a short flag or an alias. Keep a one-word "closed" window so
+        // every spelling reaches the same explicit end state.
+        Ok(Some(OptState {
+            opt,
+            word: ordinal + 1,
+            used,
+            open: false,
+            closed: true,
+        }))
     } else {
-        None
-    })
+        Ok(None)
+    }
 }
 
 /// State after a closed `--opt=value` word: `ValueDone` when the occurrence is
@@ -372,6 +463,11 @@ fn advance_opt_value<'a>(
             ParseState::ValueDone
         }
     }
+}
+
+/// Whether the whole shell word is exactly the given terminator.
+fn word_is(terminator: &OsStr, arg: &clap_lex::ParsedArg<'_>) -> bool {
+    arg.to_value_os() == terminator
 }
 
 /// Result of analyzing the value word under the cursor for an option that
@@ -542,6 +638,47 @@ fn complete_arg(
         }
         ParseState::Opt(state) => {
             let opt = state.opt;
+            // A value terminator is only ever its own whole word for a bounded
+            // delimited option.
+            if let Some(terminator) = opt.get_value_terminator() {
+                let min = opt.get_num_args().expect("built").min_values();
+                let consumed_words = state.word.saturating_sub(1);
+                let word = arg.to_value_os();
+                let term = OsStr::new(terminator.as_str());
+                let is_exact = word == term;
+                let is_glued = !is_exact && word.contains(terminator.as_str());
+                if is_glued && glued_terminator_is_illegal(opt) {
+                    // A terminator glued onto a segment of a bounded, fixed-set
+                    // delimiter option cannot be a value; the engine never
+                    // guesses a split into value plus terminator. A free-form
+                    // option takes the whole word instead.
+                    return Err(std::io::Error::other("no completion generated"));
+                }
+                if is_exact {
+                    if state.open || consumed_words < min {
+                        // A dangling delimiter still owes its segment and the
+                        // option still owes its minimum number of value words.
+                        return Err(std::io::Error::other("no completion generated"));
+                    }
+                    // The terminator closes value taking and is never itself a
+                    // candidate.
+                    return finalize_completions(completions);
+                }
+                if state.closed {
+                    // The value occurrence already closed (`--opt=value` or a
+                    // full delimiter set); only the terminator word still
+                    // belongs to it. Complete ordinary options/positionals.
+                    return complete_arg(
+                        arg,
+                        cmd,
+                        current_dir,
+                        pos_index,
+                        is_escaped,
+                        ParseState::ValueDone,
+                        disabled,
+                    );
+                }
+            }
             if !disabled.contains(opt.get_id()) {
                 match complete_separate_opt_value(arg.to_value(), &state, current_dir) {
                     Ok(values) => completions.extend(values),
@@ -632,6 +769,17 @@ fn complete_segment_value(
     arg_index: usize,
     current_dir: Option<&std::path::Path>,
 ) -> Result<Vec<CompletionCandidate>, ()> {
+    // For a bounded delimiter option with a fixed value set, the terminator is
+    // recognized only as a standalone word; glued onto a segment (`--opt=a;`,
+    // `--opt=;`) it cannot be part of a valid line and the engine never guesses
+    // a split. A free-form option takes the whole word, like clap's parser.
+    if glued_terminator_is_illegal(opt) {
+        if let Some(terminator) = opt.get_value_terminator() {
+            if value.contains(terminator.as_str()) {
+                return Err(());
+            }
+        }
+    }
     let Some(cursor) = cursor_delimited(opt, value, prior_segments)? else {
         // Not a bounded delimiter option: keep the legacy whole-word
         // completion (its own `rsplit_delimiter` handles single-value args).
