@@ -1700,6 +1700,118 @@ fn suggest_custom_arg_value_candidates_multicall_unknown() {
     assert!(complete_argv(&mut cmd, &["/usr/bin/busybox", "unknown", "--name", ""]).is_empty());
 }
 
+fn hidden_items_command() -> Command {
+    fn name_candidates() -> Vec<CompletionCandidate> {
+        vec![
+            CompletionCandidate::new("alice"),
+            CompletionCandidate::new("alina"),
+            CompletionCandidate::new("bob"),
+            // Duplicate on purpose: only the first occurrence may be kept
+            CompletionCandidate::new("alina"),
+        ]
+    }
+
+    Command::new("tool")
+        .subcommand(
+            Command::new("inspect")
+                .alias("i")
+                .arg(
+                    clap::Arg::new("name")
+                        .long("name")
+                        .add(ArgValueCandidates::new(name_candidates)),
+                )
+                .arg(
+                    clap::Arg::new("format")
+                        .long("format")
+                        .value_parser(["json", "yaml"]),
+                )
+                .arg(
+                    clap::Arg::new("internal")
+                        .long("internal")
+                        .action(clap::ArgAction::SetTrue)
+                        .hide(true),
+                )
+                .subcommand(
+                    Command::new("debug").hide(true).arg(
+                        clap::Arg::new("mode").value_parser(["on", "off"]),
+                    ),
+                ),
+        )
+        .subcommand(Command::new("status"))
+}
+
+#[test]
+fn suggest_hidden_items_boundary() {
+    let mut cmd = hidden_items_command();
+
+    // Custom candidates: duplicates collapse to the first occurrence,
+    // declaration order is preserved
+    let expected = vec!["alice", "alina", "bob"];
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "inspect", "--name", ""]),
+        expected
+    );
+    assert_eq!(complete_argv(&mut cmd, &["tool", "i", "--name", ""]), expected);
+
+    let expected = vec!["alice", "alina"];
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "inspect", "--name", "al"]),
+        expected
+    );
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "i", "--name", "al"]),
+        expected
+    );
+
+    // Empty prefix only shows public options and public paths
+    let visible = complete_argv(&mut cmd, &["tool", "inspect", ""]);
+    assert!(!visible.is_empty());
+    assert!(!visible.iter().any(|c| c == "--internal"), "{visible:?}");
+    assert!(!visible.iter().any(|c| c == "debug"), "{visible:?}");
+    let visible_alias = complete_argv(&mut cmd, &["tool", "i", ""]);
+    assert_eq!(visible, visible_alias);
+
+    // A fully typed hidden subcommand is still traversable
+    let expected = vec!["on", "off"];
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "inspect", "debug", "--", ""]),
+        expected
+    );
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "i", "debug", "--", ""]),
+        expected
+    );
+
+    // A fully typed hidden option does not disturb later completion
+    let expected = vec!["json", "yaml"];
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "inspect", "--internal", "--format", ""]),
+        expected
+    );
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "i", "--internal", "--format", ""]),
+        expected
+    );
+
+    // Unknown commands, unknown/partial aliases, illegal candidate prefixes,
+    // and incomplete spellings of hidden tokens return empty rather than
+    // falling back to root command candidates
+    for argv in [
+        &["tool", "unknown", "--name", ""][..],
+        &["tool", "in", "--name", ""][..],
+        &["tool", "inspect", "--name", "z"][..],
+        &["tool", "inspect", "--inter", "--format", ""][..],
+        &["tool", "inspect", "de", "--", ""][..],
+        &["tool", "i", "--inter", "--format", ""][..],
+        &["tool", "i", "de", "--", ""][..],
+    ] {
+        assert!(
+            complete_argv(&mut cmd, argv).is_empty(),
+            "argv={argv:?} must be empty"
+        );
+    }
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];

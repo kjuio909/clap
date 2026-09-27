@@ -251,11 +251,14 @@ fn complete_arg(
         completions.retain(|a| !a.is_hide_set());
     }
     let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_values = std::collections::HashSet::new();
     completions.retain(move |a| {
         if let Some(id) = a.get_id().cloned() {
             seen_ids.insert(id)
         } else {
-            true
+            // Candidates without an id (e.g. custom value candidates) are
+            // de-duplicated by value, keeping the first occurrence
+            seen_values.insert(a.get_value().to_owned())
         }
     });
 
