@@ -1675,6 +1675,8 @@ fn suggest_tag_terminator_open_segment() {
         "-tred, [TAB]",
         "-t=red, [TAB]",
         "--tag red, [TAB]",
+        "--label red, [TAB]",
+        "-t red, [TAB]",
     ] {
         assert_data_eq!(
             complete!(terminator_command(), input),
@@ -1720,6 +1722,50 @@ blue
         complete!(terminator_command(), "--tag red green, b[TAB]"),
         snapbox::str!["blue"]
     );
+}
+
+#[test]
+fn suggest_tag_terminator_conflicts_while_open() {
+    // Once a value word has been consumed while the occurrence is still open
+    // (space-separated values), the next word is an optional stop: remaining
+    // values plus ordinary options and positionals are offered through every
+    // spelling, while the conflicting `raw` is suppressed because tag was
+    // explicitly selected.
+    let offered = snapbox::str![[r#"
+green
+blue
+src
+dst
+--tag
+--help	Print help
+"#]];
+    for input in ["--tag red [TAB]", "--label red [TAB]", "-t red [TAB]"] {
+        assert_data_eq!(complete!(terminator_command(), input), offered.clone());
+    }
+
+    // An attached, fully closed word (`--tag=red` with no dangling delimiter)
+    // ends the occurrence exactly as in clap's parser: no further values are
+    // accepted, but ordinary options/positionals return and `raw` stays
+    // suppressed through every spelling.
+    let closed = snapbox::str![[r#"
+src
+dst
+--tag
+--help	Print help
+"#]];
+    for input in [
+        "--tag=red [TAB]",
+        "--label=red [TAB]",
+        "-tred [TAB]",
+        "-t=red [TAB]",
+    ] {
+        assert_data_eq!(complete!(terminator_command(), input), closed.clone());
+    }
+
+    // Prefixing the suppressed raw candidate still offers nothing.
+    assert_data_eq!(complete!(terminator_command(), "--tag red --r[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(terminator_command(), "-t red --raw[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(terminator_command(), "--tag=red --raw[TAB]"), snapbox::str![""]);
 }
 
 #[test]
@@ -1865,6 +1911,13 @@ fn suggest_tag_terminator_illegal_forms_error() {
         "--tag=; [TAB]",
         "--tag=;x [TAB]",
         "-tred; [TAB]",
+        // Every alias and short spelling is handled identically.
+        "--label=red; [TAB]",
+        "--label=red;[TAB]",
+        "--label=; [TAB]",
+        "-t=red; [TAB]",
+        "--label red x; [TAB]",
+        "--label red ;x [TAB]",
     ] {
         assert_eq!(
             complete_err(&mut terminator_command(), input),
@@ -1889,12 +1942,66 @@ fn suggest_tag_terminator_illegal_forms_error() {
         "--tag=red,green,blue,extra [TAB]",
         "--tag=red,,g[TAB]",
         "--tag=red,, [TAB]",
+        // The same malformed lines reached through alias and short spellings.
+        "--label purple ; [TAB]",
+        "-tred,green,blue, [TAB]",
+        "--label=red,, [TAB]",
+        "-t=red,, [TAB]",
     ] {
         assert_eq!(
             complete_err(&mut terminator_command(), input),
             "no completion generated"
         );
     }
+}
+
+#[test]
+fn suggest_tag_terminator_repeated_calls_are_stable() {
+    // The engine keeps no state on the command: consecutive calls with the
+    // same closed terminator line return byte-identical results, the consumed
+    // terminator never reopens value taking and the conflict set does not
+    // accumulate across calls.
+    let args = vec![
+        std::ffi::OsString::from("tag"),
+        "--tag".into(),
+        "red".into(),
+        ";".into(),
+        std::ffi::OsString::new(),
+    ];
+    let mut cmd = terminator_command();
+    let call = |cmd: &mut Command| {
+        clap_complete::engine::complete(cmd, args.clone(), 4, None)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.get_value().to_os_string())
+            .collect::<Vec<_>>()
+    };
+    let first = call(&mut cmd);
+    let second = call(&mut cmd);
+    let third = call(&mut cmd);
+    assert_eq!(first, second);
+    assert_eq!(first, third);
+    let literals: Vec<&str> = first.iter().map(|v| v.to_str().unwrap()).collect();
+    assert!(literals.contains(&"src"));
+    assert!(literals.contains(&"--tag"));
+    assert!(!literals.contains(&"--raw"));
+    assert!(!literals.contains(&";"));
+
+    // The consumed terminator stays consumed: an immediately following empty
+    // word never goes back to accepting tag values.
+    let values: Vec<String> = complete_values(
+        &mut terminator_command(),
+        vec![
+            "tag".into(),
+            "--tag=red".into(),
+            ";".into(),
+            std::ffi::OsString::new(),
+        ],
+        3,
+        None,
+    );
+    assert!(values.contains(&"src".to_owned()));
+    assert!(!values.contains(&"green".to_owned()));
 }
 
 /// Build the command from the task spec: a two-value comma-delimited
