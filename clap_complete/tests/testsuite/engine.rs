@@ -1531,30 +1531,50 @@ pos-c
     );
 }
 
-fn custom_candidates_command() -> Command {
+fn inspect_command() -> Command {
     fn name_candidates() -> Vec<CompletionCandidate> {
         vec![
             CompletionCandidate::new("alice"),
+            CompletionCandidate::new("alina"),
+            // Repeated on purpose: only the first occurrence may be completed
             CompletionCandidate::new("alina"),
             CompletionCandidate::new("bob"),
         ]
     }
 
-    Command::new("tool").subcommand(
-        Command::new("inspect")
-            .alias("i")
-            .arg(
-                clap::Arg::new("name")
-                    .long("name")
-                    .add(ArgValueCandidates::new(name_candidates)),
-            )
-            .arg(
-                clap::Arg::new("format")
-                    .long("format")
-                    .value_parser(["json", "yaml"]),
-            )
-            .arg(clap::Arg::new("query").value_parser(["all", "changed"])),
-    )
+    Command::new("inspect")
+        .alias("i")
+        .arg(
+            clap::Arg::new("name")
+                .long("name")
+                .add(ArgValueCandidates::new(name_candidates)),
+        )
+        .arg(
+            clap::Arg::new("format")
+                .long("format")
+                .value_parser(["json", "yaml"]),
+        )
+        .arg(clap::Arg::new("query").value_parser(["all", "changed"]))
+        .arg(
+            clap::Arg::new("internal")
+                .long("internal")
+                .action(clap::ArgAction::SetTrue)
+                .hide(true),
+        )
+        .subcommand(
+            Command::new("debug")
+                .hide(true)
+                .arg(clap::Arg::new("level").value_parser(["on", "off"])),
+        )
+}
+
+/// The full command tree: direct applets `busybox`, `inspect` and `status`,
+/// with `busybox` also dispatching to `inspect`.
+fn custom_candidates_command() -> Command {
+    Command::new("tool")
+        .subcommand(Command::new("busybox").subcommand(inspect_command()))
+        .subcommand(inspect_command())
+        .subcommand(Command::new("status"))
 }
 
 /// Call `clap_complete::engine::complete` with a full argv (including argv0),
@@ -1656,14 +1676,18 @@ fn suggest_custom_arg_value_candidates_multicall() {
         &["--name", "alice", "--name", ""],
         &["--format", ""],
         &["--", ""],
+        // A fully typed hidden token stays parseable at every entry point
+        &["--internal", "--format", ""],
+        &["debug", "--", ""],
     ];
-    // Every entry point must resolve to the same `inspect` command state.
+    // Every recognized entry point must resolve to the same `inspect` command
+    // state as the ordinary `tool inspect` invocation.
     let entry_points: &[&[&str]] = &[
-        &["tool", "inspect"],
-        &["tool", "i"],
         &["/usr/bin/inspect"],
-        &["/opt/bin/i.exe"],
+        &["/opt/tools/i.exe"],
+        &["/usr/bin/i"],
         &["/usr/bin/busybox", "inspect"],
+        &["/usr/bin/busybox", "i"],
     ];
 
     for suffix in suffixes {
@@ -1684,65 +1708,42 @@ fn suggest_custom_arg_value_candidates_multicall() {
 
 #[test]
 fn suggest_custom_arg_value_candidates_multicall_unknown() {
+    // Recognized direct applets complete against their own command
     let mut cmd = custom_candidates_command().multicall(true);
+    assert_eq!(
+        complete_argv(&mut cmd, &["/usr/bin/status", ""]),
+        vec!["--help"]
+    );
+    let mut cmd = custom_candidates_command().multicall(true);
+    assert_eq!(
+        complete_argv(&mut cmd, &["/usr/bin/busybox", ""]),
+        vec!["inspect", "help", "--help"]
+    );
 
     // Unknown invocation names must not fall back to root command candidates
+    let mut cmd = custom_candidates_command().multicall(true);
     assert!(complete_argv(&mut cmd, &["/usr/bin/unknown", "--name", ""]).is_empty());
     assert!(complete_argv(&mut cmd, &["/usr/bin/unknown", "--name", "al"]).is_empty());
     assert!(complete_argv(&mut cmd, &["/opt/bin/unknown.exe", "--name=al"]).is_empty());
     assert!(complete_argv(&mut cmd, &["/usr/bin/unknown", "zzz", ""]).is_empty());
+    // A partial applet spelling is not an entry point
+    assert!(complete_argv(&mut cmd, &["/usr/bin/ins", "--name", ""]).is_empty());
+
+    // Unknown busybox sub-applets never fall back to another applet or root
+    assert!(complete_argv(&mut cmd, &["/usr/bin/busybox", "unknown", "--name", ""]).is_empty());
+    // `status` is a direct applet, not a sub-applet of `busybox`
+    assert!(complete_argv(&mut cmd, &["/usr/bin/busybox", "status", ""]).is_empty());
 
     // Unknown options and illegal prefixes stay empty through every entry point
     assert!(complete_argv(&mut cmd, &["/usr/bin/inspect", "--name", "z"]).is_empty());
-    assert!(complete_argv(&mut cmd, &["/opt/bin/i.exe", "--name", "z"]).is_empty());
+    assert!(complete_argv(&mut cmd, &["/opt/tools/i.exe", "--name", "z"]).is_empty());
     assert!(complete_argv(&mut cmd, &["/usr/bin/inspect", "--unknown", ""]).is_empty());
     assert!(complete_argv(&mut cmd, &["/usr/bin/busybox", "inspect", "--name", "z"]).is_empty());
-    assert!(complete_argv(&mut cmd, &["/usr/bin/busybox", "unknown", "--name", ""]).is_empty());
-}
-
-fn hidden_boundary_command() -> Command {
-    fn name_candidates() -> Vec<CompletionCandidate> {
-        vec![
-            CompletionCandidate::new("alice"),
-            CompletionCandidate::new("alina"),
-            CompletionCandidate::new("bob"),
-            // Repeated on purpose: only the first occurrence may be completed
-            CompletionCandidate::new("alina"),
-        ]
-    }
-
-    Command::new("tool")
-        .subcommand(
-            Command::new("inspect")
-                .alias("i")
-                .arg(
-                    clap::Arg::new("name")
-                        .long("name")
-                        .add(ArgValueCandidates::new(name_candidates)),
-                )
-                .arg(
-                    clap::Arg::new("format")
-                        .long("format")
-                        .value_parser(["json", "yaml"]),
-                )
-                .arg(
-                    clap::Arg::new("internal")
-                        .long("internal")
-                        .action(clap::ArgAction::SetTrue)
-                        .hide(true),
-                )
-                .subcommand(
-                    Command::new("debug")
-                        .hide(true)
-                        .arg(clap::Arg::new("level").value_parser(["on", "off"])),
-                ),
-        )
-        .subcommand(Command::new("status"))
 }
 
 #[test]
 fn suggest_hidden_items_custom_values_deduped() {
-    let mut cmd = hidden_boundary_command();
+    let mut cmd = custom_candidates_command();
 
     // Duplicates collapse to their first occurrence, declaration order is kept
     let expected = vec!["alice", "alina", "bob"];
@@ -1765,17 +1766,19 @@ fn suggest_hidden_items_custom_values_deduped() {
 
 #[test]
 fn suggest_hidden_items_not_offered_on_empty_prefix() {
-    let mut cmd = hidden_boundary_command();
+    let mut cmd = custom_candidates_command();
 
     // Only public options and public paths: no `--internal`, no `debug`
-    let expected = vec!["help", "--name", "--format", "--help"];
+    let expected = vec![
+        "help", "all", "changed", "--name", "--format", "--help",
+    ];
     assert_eq!(complete_argv(&mut cmd, &["tool", "inspect", ""]), expected);
     assert_eq!(complete_argv(&mut cmd, &["tool", "i", ""]), expected);
 }
 
 #[test]
 fn suggest_hidden_subcommand_values_after_escape() {
-    let mut cmd = hidden_boundary_command();
+    let mut cmd = custom_candidates_command();
 
     let expected = vec!["on", "off"];
     assert_eq!(
@@ -1790,7 +1793,7 @@ fn suggest_hidden_subcommand_values_after_escape() {
 
 #[test]
 fn suggest_hidden_items_after_fully_typed_hidden_flag() {
-    let mut cmd = hidden_boundary_command();
+    let mut cmd = custom_candidates_command();
 
     let expected = vec!["json", "yaml"];
     assert_eq!(
@@ -1805,7 +1808,7 @@ fn suggest_hidden_items_after_fully_typed_hidden_flag() {
 
 #[test]
 fn suggest_hidden_items_unknown_paths_empty() {
-    let mut cmd = hidden_boundary_command();
+    let mut cmd = custom_candidates_command();
 
     // Unknown command, unknown alias, and partial names never fall back to
     // root command candidates
@@ -1817,7 +1820,9 @@ fn suggest_hidden_items_unknown_paths_empty() {
     assert!(complete_argv(&mut cmd, &["tool", "inspect", "--name", "z"]).is_empty());
     assert!(complete_argv(&mut cmd, &["tool", "i", "--name", "z"]).is_empty());
 
-    // Incomplete spellings of hidden tokens stay empty
+    // Incomplete spellings of hidden tokens stay empty; in particular a
+    // partial hidden subcommand followed by `--` must not surface the public
+    // `help` subcommand or positional values.
     assert!(complete_argv(&mut cmd, &["tool", "inspect", "--int", "--format", ""]).is_empty());
     assert!(complete_argv(&mut cmd, &["tool", "inspect", "deb", "--", ""]).is_empty());
     assert!(complete_argv(&mut cmd, &["tool", "i", "--int", "--format", ""]).is_empty());

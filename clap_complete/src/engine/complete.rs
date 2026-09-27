@@ -35,8 +35,11 @@ pub fn complete(
     let mut current_cmd = &*cmd;
     if cmd.is_multicall_set() {
         // A multicall executable dispatches on the file name of argv0 (the
-        // "applet"), falling back to the first argument when invoked through
-        // its canonical or an unrecognized name, e.g. `busybox inspect`.
+        // "applet"), matching clap's own parser behavior. When argv0 is the
+        // multicall launcher itself (e.g. `busybox`, itself a registered
+        // subcommand) the following argument selects the applet; an
+        // unrecognized invocation name yields no candidates rather than
+        // falling back to the root command.
         let applet = raw_args
             .next_os(&mut cursor)
             .and_then(|argv0| std::path::Path::new(argv0).file_stem().map(OsStr::to_owned));
@@ -45,18 +48,12 @@ pub fn complete(
                 debug!("complete: multicall applet={applet:?}");
                 current_cmd = subcmd;
             } else {
-                // Unknown applet name: only continue when the next argument
-                // names a known applet; otherwise there is nothing to complete.
-                let mut peek = cursor.clone();
-                let is_launcher = raw_args
-                    .next_os(&mut peek)
-                    .and_then(OsStr::to_str)
-                    .is_some_and(|next| cmd.find_subcommand(next).is_some());
-                if !is_launcher {
-                    debug!("complete: unrecognized multicall applet={applet:?}");
-                    return Ok(Vec::new());
-                }
+                debug!("complete: unrecognized multicall applet={applet:?}");
+                return Ok(Vec::new());
             }
+        } else {
+            debug!("complete: multicall without an applet name");
+            return Ok(Vec::new());
         }
     } else if !cmd.is_no_binary_name_set() {
         raw_args.next_os(&mut cursor);
@@ -187,8 +184,12 @@ fn complete_arg(
 
     match state {
         ParseState::ValueDone => {
-            if let Ok(value) = arg.to_value() {
-                completions.extend(complete_subcommand(value, cmd));
+            // After `--`, subcommands are no longer recognized; every token is
+            // parsed as a positional value.
+            if !is_escaped {
+                if let Ok(value) = arg.to_value() {
+                    completions.extend(complete_subcommand(value, cmd));
+                }
             }
 
             if let Some(positional) = cmd
