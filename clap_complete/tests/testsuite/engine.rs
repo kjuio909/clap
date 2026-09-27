@@ -1531,6 +1531,175 @@ pos-c
     );
 }
 
+fn custom_candidates_command() -> Command {
+    fn name_candidates() -> Vec<CompletionCandidate> {
+        vec![
+            CompletionCandidate::new("alice"),
+            CompletionCandidate::new("alina"),
+            CompletionCandidate::new("bob"),
+        ]
+    }
+
+    Command::new("tool").subcommand(
+        Command::new("inspect")
+            .alias("i")
+            .arg(
+                clap::Arg::new("name")
+                    .long("name")
+                    .add(ArgValueCandidates::new(name_candidates)),
+            )
+            .arg(
+                clap::Arg::new("format")
+                    .long("format")
+                    .value_parser(["json", "yaml"]),
+            )
+            .arg(clap::Arg::new("query").value_parser(["all", "changed"])),
+    )
+}
+
+/// Call `clap_complete::engine::complete` with a full argv (including argv0),
+/// the cursor sitting on the last token, and return the candidate values.
+fn complete_argv(cmd: &mut Command, argv: &[&str]) -> Vec<String> {
+    let arg_index = argv.len() - 1;
+    let args = argv.iter().map(std::ffi::OsString::from).collect();
+    clap_complete::engine::complete(cmd, args, arg_index, None)
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+}
+
+#[test]
+fn suggest_custom_arg_value_candidates_via_alias() {
+    let mut cmd = custom_candidates_command();
+
+    let expected = vec!["alice", "alina", "bob"];
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "inspect", "--name", ""]),
+        expected
+    );
+    // The alias entry point must produce identical candidates, in order
+    assert_eq!(complete_argv(&mut cmd, &["tool", "i", "--name", ""]), expected);
+
+    let expected = vec!["alice", "alina"];
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "inspect", "--name", "al"]),
+        expected
+    );
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "i", "--name", "al"]),
+        expected
+    );
+
+    assert!(complete_argv(&mut cmd, &["tool", "inspect", "--name", "z"]).is_empty());
+    assert!(complete_argv(&mut cmd, &["tool", "i", "--name", "z"]).is_empty());
+
+    // `--name=value` keeps the `=` and the typed prefix in the candidates
+    let expected = vec!["--name=alice", "--name=alina"];
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "inspect", "--name=al"]),
+        expected
+    );
+    assert_eq!(complete_argv(&mut cmd, &["tool", "i", "--name=al"]), expected);
+
+    // A repeated `--name` still resolves to the same provider, without
+    // leaking `--format` or positional values
+    let expected = vec!["alice", "alina", "bob"];
+    assert_eq!(
+        complete_argv(
+            &mut cmd,
+            &["tool", "inspect", "--name", "alice", "--name", ""]
+        ),
+        expected
+    );
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "i", "--name", "alice", "--name", ""]),
+        expected
+    );
+
+    // After `--`, only positional values are offered
+    let expected = vec!["all", "changed"];
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "inspect", "--", ""]),
+        expected
+    );
+    assert_eq!(complete_argv(&mut cmd, &["tool", "i", "--", ""]), expected);
+
+    // Static values are unaffected
+    let expected = vec!["json", "yaml"];
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "inspect", "--format", ""]),
+        expected
+    );
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "i", "--format", ""]),
+        expected
+    );
+
+    // Unknown aliases, options, and prefixes return empty rather than
+    // falling back to root command candidates
+    assert!(complete_argv(&mut cmd, &["tool", "unknown", "--name", ""]).is_empty());
+    assert!(complete_argv(&mut cmd, &["tool", "--name", ""]).is_empty());
+    assert!(complete_argv(&mut cmd, &["tool", "inspect", "--unknown", ""]).is_empty());
+    assert!(complete_argv(&mut cmd, &["tool", "inspect", "--name=z"]).is_empty());
+}
+
+#[test]
+fn suggest_custom_arg_value_candidates_multicall() {
+    // Each suffix, appended to an entry point, forms a full argv whose last
+    // token holds the cursor.
+    let suffixes: &[&[&str]] = &[
+        &["--name", ""],
+        &["--name", "al"],
+        &["--name", "z"],
+        &["--name=al"],
+        &["--name", "alice", "--name", ""],
+        &["--format", ""],
+        &["--", ""],
+    ];
+    // Every entry point must resolve to the same `inspect` command state.
+    let entry_points: &[&[&str]] = &[
+        &["tool", "inspect"],
+        &["tool", "i"],
+        &["/usr/bin/inspect"],
+        &["/opt/bin/i.exe"],
+        &["/usr/bin/busybox", "inspect"],
+    ];
+
+    for suffix in suffixes {
+        let mut reference_argv = vec!["tool", "inspect"];
+        reference_argv.extend_from_slice(suffix);
+        let mut cmd = custom_candidates_command();
+        let expected = complete_argv(&mut cmd, &reference_argv);
+
+        for entry_point in entry_points {
+            let mut argv = entry_point.to_vec();
+            argv.extend_from_slice(suffix);
+            let mut cmd = custom_candidates_command().multicall(true);
+            let actual = complete_argv(&mut cmd, &argv);
+            assert_eq!(actual, expected, "argv={argv:?}");
+        }
+    }
+}
+
+#[test]
+fn suggest_custom_arg_value_candidates_multicall_unknown() {
+    let mut cmd = custom_candidates_command().multicall(true);
+
+    // Unknown invocation names must not fall back to root command candidates
+    assert!(complete_argv(&mut cmd, &["/usr/bin/unknown", "--name", ""]).is_empty());
+    assert!(complete_argv(&mut cmd, &["/usr/bin/unknown", "--name", "al"]).is_empty());
+    assert!(complete_argv(&mut cmd, &["/opt/bin/unknown.exe", "--name=al"]).is_empty());
+    assert!(complete_argv(&mut cmd, &["/usr/bin/unknown", "zzz", ""]).is_empty());
+
+    // Unknown options and illegal prefixes stay empty through every entry point
+    assert!(complete_argv(&mut cmd, &["/usr/bin/inspect", "--name", "z"]).is_empty());
+    assert!(complete_argv(&mut cmd, &["/opt/bin/i.exe", "--name", "z"]).is_empty());
+    assert!(complete_argv(&mut cmd, &["/usr/bin/inspect", "--unknown", ""]).is_empty());
+    assert!(complete_argv(&mut cmd, &["/usr/bin/busybox", "inspect", "--name", "z"]).is_empty());
+    assert!(complete_argv(&mut cmd, &["/usr/bin/busybox", "unknown", "--name", ""]).is_empty());
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];

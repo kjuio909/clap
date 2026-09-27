@@ -32,12 +32,35 @@ pub fn complete(
     raw_args.next_os(&mut target_cursor);
     debug!("complete: target_cursor={target_cursor:?}");
 
-    // TODO: Multicall support
-    if !cmd.is_no_binary_name_set() {
+    let mut current_cmd = &*cmd;
+    if cmd.is_multicall_set() {
+        // A multicall executable dispatches on the file name of argv0 (the
+        // "applet"), falling back to the first argument when invoked through
+        // its canonical or an unrecognized name, e.g. `busybox inspect`.
+        let applet = raw_args
+            .next_os(&mut cursor)
+            .and_then(|argv0| std::path::Path::new(argv0).file_stem().map(OsStr::to_owned));
+        if let Some(applet) = applet.as_deref().and_then(OsStr::to_str) {
+            if let Some(subcmd) = cmd.find_subcommand(applet) {
+                debug!("complete: multicall applet={applet:?}");
+                current_cmd = subcmd;
+            } else {
+                // Unknown applet name: only continue when the next argument
+                // names a known applet; otherwise there is nothing to complete.
+                let mut peek = cursor.clone();
+                let is_launcher = raw_args
+                    .next_os(&mut peek)
+                    .and_then(OsStr::to_str)
+                    .is_some_and(|next| cmd.find_subcommand(next).is_some());
+                if !is_launcher {
+                    debug!("complete: unrecognized multicall applet={applet:?}");
+                    return Ok(Vec::new());
+                }
+            }
+        }
+    } else if !cmd.is_no_binary_name_set() {
         raw_args.next_os(&mut cursor);
     }
-
-    let mut current_cmd = &*cmd;
     let mut pos_index = 1;
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
@@ -96,6 +119,9 @@ pub fn complete(
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
+                } else {
+                    debug!("complete: unknown flag={flag:?}");
+                    return Ok(Vec::new());
                 }
             }
         } else if let Some(short) = arg.to_short() {
@@ -111,6 +137,13 @@ pub fn complete(
         } else {
             match current_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
+                    if current_cmd
+                        .get_positionals()
+                        .all(|p| p.get_index() != Some(pos_index))
+                    {
+                        debug!("complete: unrecognized argument={:?}", arg.to_value_os());
+                        return Ok(Vec::new());
+                    }
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
