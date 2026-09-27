@@ -561,5 +561,10 @@ name = "task015"
 path = "tests/task015.rs"
 required-features = ["derive", "help", "usage"]
 
+[[test]]
+name = "task016"
+path = "tests/task016.rs"
+required-features = ["derive", "help", "usage"]
+
 [lints]
 workspace = true
