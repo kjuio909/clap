@@ -1608,6 +1608,387 @@ dst
     );
 }
 
+#[test]
+fn suggest_default_env_sources_stay_implicit() {
+    // `format` carries a default value and an env binding, yet completion
+    // rebuilds its state only from the words on the command line: implicit
+    // sources never mark the option as present and never suppress the
+    // conflicting `raw`.
+    fn command() -> Command {
+        Command::new("fmt")
+            .arg(
+                clap::Arg::new("format")
+                    .long("format")
+                    .visible_alias("fmt-kind")
+                    .short('f')
+                    .num_args(1..=2)
+                    .value_parser(["json", "yaml"])
+                    .value_delimiter(',')
+                    .default_value("json")
+                    .env("FMT_FORMAT"),
+            )
+            .arg(
+                clap::Arg::new("raw")
+                    .long("raw")
+                    .visible_alias("unformatted")
+                    .short('r')
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("format"),
+            )
+            .arg(clap::Arg::new("dir").value_hint(clap::ValueHint::DirPath))
+    }
+
+    let testdir = snapbox::dir::DirRoot::mutable_temp().unwrap();
+    let testdir_path = testdir.path().unwrap();
+    fs::write(testdir_path.join("a_file"), "").unwrap();
+    fs::create_dir_all(testdir_path.join("c_dir/sub_dir")).unwrap();
+    fs::create_dir_all(testdir_path.join("d_dir")).unwrap();
+    fs::create_dir_all(testdir_path.join("json")).unwrap();
+
+    // `format` never appeared on the command line: despite the default value
+    // and the env binding, `format`, `raw` and their aliases stay available.
+    assert_data_eq!(
+        complete!(command(), " [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+.
+c_dir/
+d_dir/
+json/
+--format
+--raw
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "--fmt-[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str!["--fmt-kind"]
+    );
+    assert_data_eq!(
+        complete!(command(), "--u[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str!["--unformatted"]
+    );
+    assert_data_eq!(
+        complete!(command(), "-[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+-f	--format
+-r	--raw
+-h	Print help
+"#]]
+    );
+
+    // The default is not a selection: a bare `--format` still offers every
+    // value, including the default `json`.
+    assert_data_eq!(
+        complete!(command(), "--format [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+json
+yaml
+"#]]
+    );
+
+    // Typing `format` explicitly — canonical name, visible alias, short or
+    // attached value — establishes the conflict and suppresses `raw`.
+    assert_data_eq!(
+        complete!(command(), "--format=json [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+.
+c_dir/
+d_dir/
+json/
+--format
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "--fmt-kind=json [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+.
+c_dir/
+d_dir/
+json/
+--format
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "-fjson [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+.
+c_dir/
+d_dir/
+json/
+--format
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "-f=json [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+.
+c_dir/
+d_dir/
+json/
+--format
+--help	Print help
+"#]]
+    );
+
+    // The conflict is bidirectional: an explicit `--raw` suppresses `format`
+    // just the same, and the implicit default cannot resurrect it.
+    assert_data_eq!(
+        complete!(command(), "--raw [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+.
+c_dir/
+d_dir/
+json/
+--raw
+--help	Print help
+"#]]
+    );
+
+    // A separate value word keeps the occurrence open for the second value;
+    // the closed `json` segment stays selected and is not offered again.
+    assert_data_eq!(
+        complete!(command(), "--format json [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+yaml
+.
+c_dir/
+d_dir/
+json/
+--format
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "-f json [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+yaml
+.
+c_dir/
+d_dir/
+json/
+--format
+--help	Print help
+"#]]
+    );
+
+    // The segment under the cursor filters on the text after the last comma
+    // only; the caller's spelling is kept and closed segments never reappear.
+    assert_data_eq!(
+        complete!(command(), "--format=json, [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str!["yaml"]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format json, [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str!["yaml"]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format=json,y[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str!["--format=json,yaml"]
+    );
+    assert_data_eq!(
+        complete!(command(), "--fmt-kind=json,[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str!["--fmt-kind=json,yaml"]
+    );
+    assert_data_eq!(
+        complete!(command(), "-fjson,[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str!["-fjson,yaml"]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format=json,j[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![""]
+    );
+
+    // The word being edited is not part of the conflict set yet, but state
+    // from closed words applies to it: an explicit `--raw` leaves nothing to
+    // complete on `format`'s value, and a closed `format` occurrence
+    // suppresses the conflicting option, alias included.
+    assert_data_eq!(
+        complete!(command(), "--format=j[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str!["--format=json"]
+    );
+    assert_data_eq!(
+        complete!(command(), "--raw --format=j[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format json --r[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format json --u[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![""]
+    );
+
+    // Past `--` the explicit conflict state still applies, but only the
+    // positional's directory candidates are offered: no option, alias or
+    // value leaks, and each directory appears once, in sorted order.
+    assert_data_eq!(
+        complete!(command(), "--format=json,yaml -- [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+.
+c_dir/
+d_dir/
+json/
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "--raw -- [TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![[r#"
+.
+c_dir/
+d_dir/
+json/
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format=json,yaml -- c[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str!["c_dir/"]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format=json,yaml -- c_dir/[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str!["c_dir/sub_dir/"]
+    );
+
+    // Unknown values, empty segments, a third segment, illegal `=` forms and
+    // a dangling segment cut by `--` cannot be part of a valid command line:
+    // completion reports the existing error instead of returning an empty
+    // success or guessing from the default, the env or the editing word.
+    for input in [
+        "--format=junk [TAB]",
+        "--format junk [TAB]",
+        "--fmt-kind=junk, [TAB]",
+        "-fjunk [TAB]",
+        "--format=,json [TAB]",
+        "--format=json,, [TAB]",
+        "--format=json,yaml,toml [TAB]",
+        "--format=json,yaml, [TAB]",
+        "--format=json=y [TAB]",
+        "--format==json [TAB]",
+        "--format=json, -- [TAB]",
+    ] {
+        assert_eq!(complete_err(&mut command(), input), "no completion generated");
+    }
+    for input in [
+        "--format=,[TAB]",
+        "--format=json,,y[TAB]",
+        "--format=json,yaml,[TAB]",
+        "--format=json,yaml,t[TAB]",
+    ] {
+        assert_eq!(complete_err(&mut command(), input), "no completion generated");
+    }
+
+    // An unfinished segment only filters: an unknown prefix has no candidate.
+    assert_data_eq!(
+        complete!(command(), "--format=z[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format=json,z[TAB]", current_dir = Some(testdir_path)),
+        snapbox::str![""]
+    );
+}
+
+#[test]
+fn complete_no_binary_name_implicit_sources() {
+    // The first word keeps its setting-dependent meaning: with
+    // `no_binary_name` it is parsed as an option, otherwise it is the program
+    // name and is skipped — never mistaken for an option or the positional.
+    fn command() -> Command {
+        Command::new("fmt")
+            .no_binary_name(true)
+            .arg(
+                clap::Arg::new("format")
+                    .long("format")
+                    .visible_alias("fmt-kind")
+                    .short('f')
+                    .num_args(1..=2)
+                    .value_parser(["json", "yaml"])
+                    .value_delimiter(',')
+                    .default_value("json")
+                    .env("FMT_FORMAT"),
+            )
+            .arg(
+                clap::Arg::new("raw")
+                    .long("raw")
+                    .visible_alias("unformatted")
+                    .short('r')
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("format"),
+            )
+            .arg(clap::Arg::new("dir").value_hint(clap::ValueHint::DirPath))
+    }
+
+    let testdir = snapbox::dir::DirRoot::mutable_temp().unwrap();
+    let testdir_path = testdir.path().unwrap();
+    fs::write(testdir_path.join("a_file"), "").unwrap();
+    fs::create_dir_all(testdir_path.join("c_dir")).unwrap();
+    fs::create_dir_all(testdir_path.join("d_dir")).unwrap();
+    fs::create_dir_all(testdir_path.join("json")).unwrap();
+
+    // With `no_binary_name`, the word sequence carries no program name and
+    // the first word records `format` as present.
+    let mut cmd = command();
+    let completions = clap_complete::engine::complete(
+        &mut cmd,
+        vec!["--format".into(), "json".into(), "".into()],
+        2,
+        Some(testdir_path),
+    )
+    .unwrap()
+    .into_iter()
+    .map(|c| c.get_value().to_str().unwrap().to_owned())
+    .collect::<Vec<_>>();
+    assert_eq!(
+        completions,
+        vec!["yaml", ".", "c_dir/", "d_dir/", "json/", "--format", "--help"]
+    );
+
+    // With default settings the leading program name is skipped; the same
+    // state is rebuilt from the remaining words.
+    let mut cmd = command().no_binary_name(false);
+    let completions = clap_complete::engine::complete(
+        &mut cmd,
+        vec![
+            "fmt".into(),
+            "--format".into(),
+            "json".into(),
+            "".into(),
+        ],
+        3,
+        Some(testdir_path),
+    )
+    .unwrap()
+    .into_iter()
+    .map(|c| c.get_value().to_str().unwrap().to_owned())
+    .collect::<Vec<_>>();
+    assert_eq!(
+        completions,
+        vec!["yaml", ".", "c_dir/", "d_dir/", "json/", "--format", "--help"]
+    );
+
+    // The program name is not mistaken for the positional either: the first
+    // positional's directory candidates are still offered, and nothing was
+    // suppressed.
+    let mut cmd = command().no_binary_name(false);
+    let completions = clap_complete::engine::complete(
+        &mut cmd,
+        vec!["fmt".into(), "".into()],
+        1,
+        Some(testdir_path),
+    )
+    .unwrap()
+    .into_iter()
+    .map(|c| c.get_value().to_str().unwrap().to_owned())
+    .collect::<Vec<_>>();
+    assert_eq!(
+        completions,
+        vec![".", "c_dir/", "d_dir/", "json/", "--format", "--raw", "--help"]
+    );
+}
+
 fn complete_err(cmd: &mut Command, args: impl AsRef<str>) -> String {
     let input = args.as_ref();
     let mut raw = vec![std::ffi::OsString::from(cmd.get_name())];
