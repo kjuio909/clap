@@ -151,3 +151,69 @@ fn global_flag_2x_used_inner() {
     assert!(inner_can_access_flag(&m, true, 2));
     assert!(outer_can_access_flag(&m, true, 2));
 }
+
+fn get_append_app() -> Command {
+    Command::new("myprog")
+        .arg(
+            Arg::new("GLOBAL_ARG")
+                .long("global-arg")
+                .help("Specifies something needed by the subcommands")
+                .global(true)
+                .action(ArgAction::Append),
+        )
+        .subcommand(Command::new("outer").defer(|cmd| cmd.subcommand(Command::new("inner"))))
+}
+
+fn get_values(m: &ArgMatches) -> Vec<String> {
+    m.get_many::<String>("GLOBAL_ARG")
+        .unwrap_or_default()
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn global_append_arg_used_top_level() {
+    let m = get_append_app()
+        .try_get_matches_from(["myprog", "--global-arg", "a", "--global-arg", "b", "outer", "inner"])
+        .unwrap();
+
+    let expected = vec!["a".to_owned(), "b".to_owned()];
+    assert_eq!(get_values(&m), expected);
+    assert_eq!(get_values(get_outer_matches(&m)), expected);
+    assert_eq!(get_values(get_inner_matches(&m)), expected);
+}
+
+#[test]
+fn global_append_arg_used_inner() {
+    let m = get_append_app()
+        .try_get_matches_from(["myprog", "outer", "inner", "--global-arg", "a", "--global-arg", "b"])
+        .unwrap();
+
+    let expected = vec!["a".to_owned(), "b".to_owned()];
+    assert_eq!(get_values(&m), expected);
+    assert_eq!(get_values(get_outer_matches(&m)), expected);
+    assert_eq!(get_values(get_inner_matches(&m)), expected);
+}
+
+#[test]
+fn global_append_arg_used_at_every_level() {
+    let m = get_append_app()
+        .try_get_matches_from([
+            "myprog",
+            "--global-arg",
+            "a",
+            "outer",
+            "--global-arg",
+            "b",
+            "inner",
+            "--global-arg",
+            "c",
+        ])
+        .unwrap();
+
+    // Values accumulate in command-line order, regardless of the level they appeared at
+    let expected = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+    assert_eq!(get_values(&m), expected);
+    assert_eq!(get_values(get_outer_matches(&m)), expected);
+    assert_eq!(get_values(get_inner_matches(&m)), expected);
+}

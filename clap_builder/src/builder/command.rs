@@ -4333,13 +4333,16 @@ impl Command {
         &self.args
     }
 
-    fn get_used_global_args(&self, matches: &ArgMatches, global_arg_vec: &mut Vec<Id>) {
-        global_arg_vec.extend(
-            self.args
-                .args()
-                .filter(|a| a.is_global_set())
-                .map(|ga| ga.id.clone()),
-        );
+    fn get_used_global_args(&self, matches: &ArgMatches, global_arg_vec: &mut Vec<Arg>) {
+        // Global arguments are copied into each subcommand, so deduplicate by id
+        let mut new_args = self
+            .args
+            .args()
+            .filter(|a| a.is_global_set())
+            .filter(|a| !global_arg_vec.iter().any(|g| g.get_id() == a.get_id()))
+            .cloned()
+            .collect::<Vec<_>>();
+        global_arg_vec.append(&mut new_args);
         if let Some((id, matches)) = matches.subcommand() {
             if let Some(used_sub) = self.find_subcommand(id) {
                 used_sub.get_used_global_args(matches, global_arg_vec);

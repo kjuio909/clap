@@ -5,7 +5,7 @@ use std::ops::Deref;
 
 // Internal
 use crate::INTERNAL_ERROR_MSG;
-use crate::builder::{Arg, ArgPredicate, Command};
+use crate::builder::{Arg, ArgAction, ArgPredicate, Command};
 use crate::parser::Identifier;
 use crate::parser::PendingArg;
 use crate::parser::{ArgMatches, MatchedArg, SubCommand, ValueSource};
@@ -44,7 +44,7 @@ impl ArgMatcher {
         self.matches
     }
 
-    pub(crate) fn propagate_globals(&mut self, global_arg_vec: &[Id]) {
+    pub(crate) fn propagate_globals(&mut self, global_arg_vec: &[Arg]) {
         debug!("ArgMatcher::get_global_values: global_arg_vec={global_arg_vec:?}");
         let mut vals_map = FlatMap::new();
         self.fill_in_global_values(global_arg_vec, &mut vals_map);
@@ -52,28 +52,39 @@ impl ArgMatcher {
 
     fn fill_in_global_values(
         &mut self,
-        global_arg_vec: &[Id],
+        global_arg_vec: &[Arg],
         vals_map: &mut FlatMap<Id, MatchedArg>,
     ) {
         for global_arg in global_arg_vec {
-            if let Some(ma) = self.get(global_arg) {
+            let global_arg_id = global_arg.get_id();
+            if let Some(ma) = self.get(global_arg_id) {
                 // We have to check if the parent's global arg wasn't used but still exists
                 // such as from a default value.
                 //
                 // For example, `myprog subcommand --global-arg=value` where `--global-arg` defines
                 // a default value of `other` myprog would have an existing MatchedArg for
                 // `--global-arg` where the value is `other`
-                let to_update = if let Some(parent_ma) = vals_map.get(global_arg) {
+                let to_update = if let Some(parent_ma) = vals_map.get(global_arg_id) {
                     if parent_ma.source() > ma.source() {
-                        parent_ma
+                        parent_ma.clone()
+                    } else if ma.source() > parent_ma.source() {
+                        ma.clone()
+                    } else if ma.source() == Some(ValueSource::CommandLine)
+                        && matches!(global_arg.get_action(), ArgAction::Append)
+                    {
+                        // Both the parent and this command received occurrences of a
+                        // multi-value global argument; accumulate them in the order they
+                        // appeared on the command-line.
+                        let mut merged = parent_ma.clone();
+                        merged.append_occurrences(ma);
+                        merged
                     } else {
-                        ma
+                        ma.clone()
                     }
                 } else {
-                    ma
-                }
-                .clone();
-                vals_map.insert(global_arg.clone(), to_update);
+                    ma.clone()
+                };
+                vals_map.insert(global_arg_id.clone(), to_update);
             }
         }
         if let Some(ref mut sc) = self.matches.subcommand {

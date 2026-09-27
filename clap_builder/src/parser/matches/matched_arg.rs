@@ -126,6 +126,16 @@ impl MatchedArg {
         self.vals.iter().map(|v| v.len()).sum()
     }
 
+    /// Append another occurrence's values onto this one, preserving order.
+    ///
+    /// Used to accumulate a global argument's values across command / subcommand
+    /// boundaries.
+    pub(crate) fn append_occurrences(&mut self, other: &Self) {
+        self.indices.extend(other.indices.iter().cloned());
+        self.vals.extend(other.vals.iter().cloned());
+        self.raw_vals.extend(other.raw_vals.iter().cloned());
+    }
+
     // Will be used later
     #[allow(dead_code)]
     pub(crate) fn num_vals_last_group(&self) -> usize {
