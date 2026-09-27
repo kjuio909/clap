@@ -313,6 +313,11 @@ fn consume_opt_word<'a>(
     if value.contains(delim_str) && segments.iter().any(|s| s.is_empty()) {
         return Err(());
     }
+    // A closed segment must name a value the option accepts; an unknown value
+    // cannot be part of a valid command line.
+    if !segments_are_known(opt, &segments) {
+        return Err(());
+    }
     let closed = used.len() + segments.len();
     if closed > max || (closed == max && dangling) {
         return Err(());
@@ -381,6 +386,26 @@ struct DelimCursor<'s> {
     prefix: &'s str,
 }
 
+/// Whether every closed delimiter segment names a value the option accepts.
+///
+/// Options without a fixed value set accept anything.  A bare empty value
+/// (`--opt=`) keeps its legacy tolerant treatment; empty segments separated
+/// by a delimiter are rejected before this point.  A segment that is not
+/// valid UTF-8 cannot match a possible value and is rejected, as clap's
+/// parser would reject it.
+fn segments_are_known(opt: &clap::Arg, segments: &[&OsStr]) -> bool {
+    let Some(possible) = possible_values(opt) else {
+        return true;
+    };
+    let ignore_case = opt.is_ignore_case_set();
+    let possible: Vec<_> = possible.collect();
+    segments.iter().all(|segment| {
+        segment
+            .to_str()
+            .is_some_and(|s| s.is_empty() || possible.iter().any(|pv| pv.matches(s, ignore_case)))
+    })
+}
+
 /// Split the cursor value of a bounded delimiter option into the segment being
 /// edited and its already closed prefix segments.
 ///
@@ -414,15 +439,19 @@ fn cursor_delimited<'s>(
         }));
     };
     let (prefix, current) = value_str.split_at(pos + delim.len_utf8());
-    let closed: Vec<&str> = prefix[..prefix.len() - delim_str.len()]
+    let closed: Vec<&OsStr> = prefix[..prefix.len() - delim_str.len()]
         .split(delim)
+        .map(OsStr::new)
         .collect();
-    if closed.iter().any(|s| s.is_empty()) || prior_segments + closed.len() >= max {
+    if closed.iter().any(|s| s.is_empty())
+        || prior_segments + closed.len() >= max
+        || !segments_are_known(opt, &closed)
+    {
         return Err(());
     }
     Ok(Some(DelimCursor {
         current: OsStr::new(current),
-        closed: closed.into_iter().map(OsStr::new).collect(),
+        closed,
         prefix,
     }))
 }

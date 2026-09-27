@@ -1445,6 +1445,25 @@ toml
         assert_eq!(complete_err(&mut command(), input), "no completion generated");
     }
 
+    // A closed word carrying an unknown value cannot be part of a valid
+    // command line, whichever spelling carried it.
+    for input in [
+        "--format=junk, [TAB]",
+        "--format=junk [TAB]",
+        "--format junk [TAB]",
+        "--format json,junk [TAB]",
+        "--fmt-kind=junk, [TAB]",
+        "-fjson,junk [TAB]",
+    ] {
+        assert_eq!(complete_err(&mut command(), input), "no completion generated");
+    }
+
+    // An unknown closed segment inside the word being edited is illegal too;
+    // only the segment under the cursor is filtered.
+    for input in ["--format=junk,[TAB]", "--format=junk,y[TAB]"] {
+        assert_eq!(complete_err(&mut command(), input), "no completion generated");
+    }
+
     // An unfinished single segment keeps filtering like any value, and an
     // unknown prefix simply has no candidate.
     assert_data_eq!(
@@ -1507,6 +1526,85 @@ fn suggest_delimited_multi_value_conflict_suppression() {
     assert_data_eq!(
         complete!(command(), "--format=json --r[TAB]"),
         snapbox::str![""]
+    );
+}
+
+#[test]
+fn suggest_delimited_multi_value_alias_short_and_positional() {
+    // The canonical name, its visible alias and its short all resolve to the
+    // same option state; after `--` only the positional values are offered.
+    fn command() -> Command {
+        Command::new("fmt")
+            .arg(
+                clap::Arg::new("format")
+                    .long("format")
+                    .visible_alias("fmt")
+                    .short('f')
+                    .num_args(1..=2)
+                    .value_parser(["json", "yaml", "toml"])
+                    .value_delimiter(','),
+            )
+            .arg(
+                clap::Arg::new("raw")
+                    .long("raw")
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("format"),
+            )
+            .arg(clap::Arg::new("path").value_parser(["src", "dst"]))
+    }
+
+    // Every spelling of a closed first segment reaches the same selected
+    // state: only the unused values are offered, `raw` stays suppressed, and
+    // the candidate keeps the caller's spelling.
+    assert_data_eq!(
+        complete!(command(), "--fmt=json, [TAB]"),
+        snapbox::str![[r#"
+yaml
+toml
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "-fjson, [TAB]"),
+        snapbox::str![[r#"
+yaml
+toml
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "--fmt=json,[TAB]"),
+        snapbox::str![[r#"
+--fmt=json,yaml
+--fmt=json,toml
+"#]]
+    );
+
+    // The word being edited filters on its own segment only and does not
+    // change the conflict set.
+    assert_data_eq!(
+        complete!(command(), "--fmt=j[TAB]"),
+        snapbox::str!["--fmt=json"]
+    );
+    assert_data_eq!(
+        complete!(command(), "--fmt=json,y[TAB]"),
+        snapbox::str!["--fmt=json,yaml"]
+    );
+
+    // Unknown closed values fail through every spelling.
+    for input in ["--fmt=junk, [TAB]", "-fjunk [TAB]", "--format junk, [TAB]"] {
+        assert_eq!(complete_err(&mut command(), input), "no completion generated");
+    }
+
+    // After `--` only the positional values remain.
+    assert_data_eq!(
+        complete!(command(), "--format=json,yaml -- [TAB]"),
+        snapbox::str![[r#"
+src
+dst
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "-- s[TAB]"),
+        snapbox::str!["src"]
     );
 }
 
