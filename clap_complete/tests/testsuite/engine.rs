@@ -1422,6 +1422,17 @@ toml
         "--format=json,yaml,toml [TAB]",
         "--format=json,yaml, --unformatted[TAB]",
         "--format=json,yaml, junk[TAB]",
+        // A closed segment that names no possible value is rejected just like
+        // clap would reject it, whether it sits in a prior word or before the
+        // segment still being edited.
+        "--format=junk, [TAB]",
+        "--format=junk,yaml [TAB]",
+        "--format=junk,[TAB]",
+        "--format=junk,y[TAB]",
+        "--format junk [TAB]",
+        "--format junk, [TAB]",
+        "--fmt-kind=junk, [TAB]",
+        "-f=junk, [TAB]",
     ] {
         assert_eq!(complete_err(&mut command(), input), "no completion generated");
     }
@@ -1507,6 +1518,172 @@ fn suggest_delimited_multi_value_conflict_suppression() {
     assert_data_eq!(
         complete!(command(), "--format=json --r[TAB]"),
         snapbox::str![""]
+    );
+}
+
+#[test]
+fn suggest_delimited_multi_value_aliases_and_prefix() {
+    // `--format` accepts at most two comma-separated values from a fixed set.
+    // The canonical long name, the visible alias `--fmt` and the short `-f`
+    // all describe the same argument, which conflicts with the value-less
+    // `--raw`; the only positionals accept `src`/`dst`.
+    fn command() -> Command {
+        Command::new("fmt")
+            .arg(
+                clap::Arg::new("format")
+                    .long("format")
+                    .visible_alias("fmt")
+                    .short('f')
+                    .num_args(1..=2)
+                    .value_parser([
+                        PossibleValue::new("json"),
+                        PossibleValue::new("yaml"),
+                        PossibleValue::new("toml"),
+                    ])
+                    .value_delimiter(','),
+            )
+            .arg(
+                clap::Arg::new("raw")
+                    .long("raw")
+                    .short('r')
+                    .action(clap::ArgAction::SetTrue)
+                    .conflicts_with("format"),
+            )
+            .arg(clap::Arg::new("dir").value_parser(["src", "dst"]))
+    }
+
+    // A closed first segment with a dangling delimiter can only continue with
+    // the unused second segment: `json` never reappears and neither `raw` nor
+    // unrelated candidates show up.  Every spelling of the option behaves
+    // alike and its candidates keep that spelling as their prefix.
+    assert_data_eq!(
+        complete!(command(), "--format=json,[TAB]"),
+        snapbox::str![[r#"
+--format=json,yaml
+--format=json,toml
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "--fmt=json,[TAB]"),
+        snapbox::str![[r#"
+--fmt=json,yaml
+--fmt=json,toml
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "-fjson,[TAB]"),
+        snapbox::str![[r#"
+-fjson,yaml
+-fjson,toml
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "-f=json,[TAB]"),
+        snapbox::str![[r#"
+-f=json,yaml
+-f=json,toml
+"#]]
+    );
+    // The dangling delimiter on a closed word forces the next empty word to be
+    // the second segment as well, including with space-separated values.
+    assert_data_eq!(
+        complete!(command(), "--format=json, [TAB]"),
+        snapbox::str![[r#"
+yaml
+toml
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format json, [TAB]"),
+        snapbox::str![[r#"
+yaml
+toml
+"#]]
+    );
+
+    // While editing, only the segment after the last comma is filtered.  An
+    // unfinished first segment filters on its own prefix without changing the
+    // conflict set, and the option spelling is preserved as the prefix.
+    assert_data_eq!(
+        complete!(command(), "--fmt=j[TAB]"),
+        snapbox::str!["--fmt=json"]
+    );
+    assert_data_eq!(
+        complete!(command(), "-fj[TAB]"),
+        snapbox::str!["-fjson"]
+    );
+    assert_data_eq!(
+        complete!(command(), "--fmt=json,y[TAB]"),
+        snapbox::str!["--fmt=json,yaml"]
+    );
+    assert_data_eq!(
+        complete!(command(), "-fjson,y[TAB]"),
+        snapbox::str!["-fjson,yaml"]
+    );
+    // The word still being edited is not part of the selected state, so a
+    // non-matching open segment just yields nothing.
+    assert_data_eq!(
+        complete!(command(), "--fmt=json,z[TAB]"),
+        snapbox::str![""]
+    );
+
+    // Empty segments, unknown closed values, repeated commas, a third segment
+    // or exceeding the cap all fail with the established error instead of a
+    // guessed split or a partial success.
+    for input in [
+        "--format=,[TAB]",
+        "--format=,json[TAB]",
+        "--format=json,,[TAB]",
+        "--format=junk,[TAB]",
+        "--format=junk,y[TAB]",
+        "--format=junk, [TAB]",
+        "--fmt=junk, [TAB]",
+        "-f=junk, [TAB]",
+        "--format junk [TAB]",
+        "--format=json,yaml, [TAB]",
+        "--format=json,yaml,t[TAB]",
+    ] {
+        assert_eq!(complete_err(&mut command(), input), "no completion generated");
+    }
+
+    // Once two segments are closed, ordinary completion resumes for positionals
+    // and options, with the conflicting `raw` still suppressed under every name.
+    assert_data_eq!(
+        complete!(command(), "--format=json,yaml [TAB]"),
+        snapbox::str![[r#"
+src
+dst
+--format
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format=json,yaml --r[TAB]"),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format=json,yaml -[TAB]"),
+        snapbox::str![[r#"
+-f	--format
+-h	Print help
+"#]]
+    );
+
+    // After `--`, only positionals are completed; option conflicts do not
+    // change that.
+    assert_data_eq!(
+        complete!(command(), "-- [TAB]"),
+        snapbox::str![[r#"
+src
+dst
+"#]]
+    );
+    assert_data_eq!(
+        complete!(command(), "--format=json,yaml -- [TAB]"),
+        snapbox::str![[r#"
+src
+dst
+"#]]
     );
 }
 

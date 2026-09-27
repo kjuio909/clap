@@ -313,6 +313,11 @@ fn consume_opt_word<'a>(
     if value.contains(delim_str) && segments.iter().any(|s| s.is_empty()) {
         return Err(());
     }
+    // Closed segments must name values the parser accepts; the unfinished
+    // segment of a later word is validated once that word closes.
+    if segments.iter().any(|s| !segment_is_possible(opt, s)) {
+        return Err(());
+    }
     let closed = used.len() + segments.len();
     if closed > max || (closed == max && dangling) {
         return Err(());
@@ -417,7 +422,12 @@ fn cursor_delimited<'s>(
     let closed: Vec<&str> = prefix[..prefix.len() - delim_str.len()]
         .split(delim)
         .collect();
-    if closed.iter().any(|s| s.is_empty()) || prior_segments + closed.len() >= max {
+    if closed.iter().any(|s| s.is_empty())
+        || prior_segments + closed.len() >= max
+        || closed
+            .iter()
+            .any(|s| !segment_is_possible(opt, OsStr::new(s)))
+    {
         return Err(());
     }
     Ok(Some(DelimCursor {
@@ -1086,6 +1096,23 @@ fn possible_values(
     } else {
         a.get_value_parser().possible_values()
     }
+}
+
+/// Whether a closed delimiter segment names a value the parser accepts.
+///
+/// When the argument advertises possible values, a segment has to be one of
+/// them (matching by name or alias, honoring `ignore_case`), mirroring the
+/// parser's own rejection. Arguments without a fixed value set accept anything,
+/// and so do non-UTF-8 segments which cannot be matched textually.
+fn segment_is_possible(opt: &clap::Arg, segment: &OsStr) -> bool {
+    let Some(values) = possible_values(opt) else {
+        return true;
+    };
+    let Some(segment) = segment.to_str() else {
+        return true;
+    };
+    let ignore_case = opt.is_ignore_case_set();
+    values.into_iter().any(|v| v.matches(segment, ignore_case))
 }
 
 /// Gets subcommands of [`clap::Command`] in the form of `("name", "bin_name")`.
