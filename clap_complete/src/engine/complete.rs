@@ -53,6 +53,11 @@ pub fn complete(
     // values, positionals, `--`-escaped words, default values and env values
     // never are.
     let mut explicit_opts = HashSet::<Id>::new();
+    // Ids of options whose standalone value terminator has already been
+    // consumed. A terminator only belongs to its option while that option is
+    // collecting; a second one is a repeated terminator and cannot be guessed
+    // at as a value, an option or a positional.
+    let mut terminated_opts = HashSet::<Id>::new();
     while let Some(arg) = raw_args.next(&mut cursor) {
         let current_state = next_state;
         next_state = ParseState::ValueDone;
@@ -65,6 +70,10 @@ pub fn complete(
                 return Err(std::io::Error::other("no completion generated"));
             }
             let disabled = gather_disabled_args(current_cmd, &explicit_opts);
+            let ctx = CompleteCtx {
+                disabled: &disabled,
+                terminated: &terminated_opts,
+            };
             return complete_arg(
                 &arg,
                 current_cmd,
@@ -72,7 +81,7 @@ pub fn complete(
                 pos_index,
                 is_escaped,
                 current_state,
-                &disabled,
+                &ctx,
             );
         }
 
@@ -86,6 +95,41 @@ pub fn complete(
                     pos_index = 1;
                     continue;
                 }
+            }
+        }
+
+        // A standalone value terminator is a state transition rather than a
+        // value: while its option is still collecting it ends value taking
+        // exactly as clap's parser checks the terminator before consuming a
+        // word. The terminator only becomes valid once the option received at
+        // least its required number of values and has no segment left open by
+        // a dangling delimiter; either failure makes the line unparsable.
+        if !is_escaped {
+            if let ParseState::Opt(state) = &current_state {
+                if is_value_terminator(state.opt, arg.to_value_os()) {
+                    let min = state.opt.get_num_args().expect("built").min_values();
+                    // A dangling delimiter opened an empty next segment; the
+                    // terminator cannot close it, and clap rejects the empty
+                    // segment when the occurrence is resolved.
+                    if state.open || state.used.len() < min {
+                        is_illegal = true;
+                    } else {
+                        terminated_opts.insert(state.opt.get_id().clone());
+                        next_state = ParseState::ValueDone;
+                    }
+                    continue;
+                }
+            }
+            // A terminator only ends its own option while that option is
+            // collecting; one that already terminated its occurrence is a
+            // repeated terminator and cannot be a value, an option or a
+            // positional, so report an error instead of guessing.
+            let repeated_terminator = current_cmd.get_arguments().any(|a| {
+                terminated_opts.contains(a.get_id()) && is_value_terminator(a, arg.to_value_os())
+            });
+            if repeated_terminator {
+                is_illegal = true;
+                continue;
             }
         }
 
@@ -239,6 +283,22 @@ impl<'a> OptState<'a> {
     }
 }
 
+/// Whether `word` is the option's standalone value terminator.
+///
+/// The terminator ends value taking only as a whole, separate word; it is
+/// compared on raw bytes like clap's parser does in `check_terminator`.
+fn is_value_terminator(opt: &clap::Arg, word: &OsStr) -> bool {
+    opt.get_value_terminator()
+        .is_some_and(|term| word == OsStr::new(term.as_str()))
+}
+
+/// Whether a value word carries the option's terminator glued to other text
+/// (e.g. `a;` or `;b`), which can neither terminate nor be a value.
+fn contains_value_terminator(opt: &clap::Arg, value: &OsStr) -> bool {
+    opt.get_value_terminator()
+        .is_some_and(|term| value.contains(term.as_str()))
+}
+
 /// Whether an option carries several values split by a delimiter inside one
 /// shell word *and* bounds how many such values it accepts.
 ///
@@ -288,6 +348,13 @@ fn consume_opt_word<'a>(
     let max = range.max_values();
     let ordinal = prior.word;
     let mut used = prior.used;
+
+    // The terminator ends value taking only as a standalone word; glued to any
+    // text it is not the terminator, and an option with a fixed value set
+    // rejects it while parsing the word, exactly as clap does.
+    if contains_value_terminator(opt, value) && possible_values(opt).is_some() {
+        return Err(());
+    }
 
     let Some(delim) = is_bounded_delimited(opt) else {
         // Legacy behavior: count whole shell words against the range; whatever
@@ -456,6 +523,14 @@ fn cursor_delimited<'s>(
     }))
 }
 
+/// Cross-cutting sets gathered while parsing the words before the cursor:
+/// arguments hidden because they conflict with an explicitly present option,
+/// and options whose standalone value terminator has already been consumed.
+struct CompleteCtx<'a> {
+    disabled: &'a HashSet<Id>,
+    terminated: &'a HashSet<Id>,
+}
+
 fn complete_arg(
     arg: &clap_lex::ParsedArg<'_>,
     cmd: &clap::Command,
@@ -463,8 +538,10 @@ fn complete_arg(
     pos_index: usize,
     is_escaped: bool,
     state: ParseState<'_>,
-    disabled: &HashSet<Id>,
+    ctx: &CompleteCtx<'_>,
 ) -> Result<Vec<CompletionCandidate>, std::io::Error> {
+    let disabled = ctx.disabled;
+    let terminated = ctx.terminated;
     debug!(
         "complete_arg: arg={:?}, cmd={:?}, current_dir={:?}, pos_index={:?}, state={:?}",
         arg,
@@ -477,6 +554,29 @@ fn complete_arg(
 
     match state {
         ParseState::ValueDone => {
+            // Once an option's terminator ended its occurrence, a later word
+            // that is that terminator again or carries it glued to other text
+            // (`;x`, `x;`) is a repeated/glued terminator, not a positional:
+            // clap rejects it, so completion reports an error instead of
+            // guessing. (A terminator after an occurrence closed without one,
+            // e.g. `--opt=v ;`, is an ordinary positional word and keeps that
+            // path.)
+            if !is_escaped {
+                let glued_or_repeated = cmd.get_arguments().any(|a| {
+                    if !terminated.contains(a.get_id()) {
+                        return false;
+                    }
+                    let Some(term) = a.get_value_terminator() else {
+                        return false;
+                    };
+                    let word = arg.to_value_os();
+                    word == OsStr::new(term.as_str())
+                        || (possible_values(a).is_some() && word.contains(term.as_str()))
+                });
+                if glued_or_repeated {
+                    return Err(std::io::Error::other("no completion generated"));
+                }
+            }
             // A closed `--name=value` word (or a short cluster carrying an
             // inline value, e.g. `-ovalue` / `-o=value`) is the option's value
             // position: only the option's own values are completed, exactly as
@@ -542,6 +642,18 @@ fn complete_arg(
         }
         ParseState::Opt(state) => {
             let opt = state.opt;
+            // The cursor sitting on the standalone terminator is the value-end
+            // transition: the terminator itself is never a candidate and no
+            // option or positional leaks onto that word. A dangling delimiter
+            // or an unfilled minimum leaves the occurrence unclosable, so the
+            // line is illegal exactly as clap's parser rejects it.
+            if is_value_terminator(opt, arg.to_value_os()) {
+                let min = opt.get_num_args().expect("built").min_values();
+                if state.open || state.used.len() < min {
+                    return Err(std::io::Error::other("no completion generated"));
+                }
+                return finalize_completions(completions);
+            }
             if !disabled.contains(opt.get_id()) {
                 match complete_separate_opt_value(arg.to_value(), &state, current_dir) {
                     Ok(values) => completions.extend(values),
@@ -563,7 +675,7 @@ fn complete_arg(
                     pos_index,
                     is_escaped,
                     ParseState::ValueDone,
-                    disabled,
+                    ctx,
                 )?);
             }
         }
@@ -632,6 +744,12 @@ fn complete_segment_value(
     arg_index: usize,
     current_dir: Option<&std::path::Path>,
 ) -> Result<Vec<CompletionCandidate>, ()> {
+    // The terminator ends value taking only on its own; glued to the word
+    // under the cursor it is neither a value nor a terminator for an option
+    // with a fixed value set.
+    if contains_value_terminator(opt, value) && possible_values(opt).is_some() {
+        return Err(());
+    }
     let Some(cursor) = cursor_delimited(opt, value, prior_segments)? else {
         // Not a bounded delimiter option: keep the legacy whole-word
         // completion (its own `rsplit_delimiter` handles single-value args).
@@ -905,47 +1023,21 @@ fn complete_arg_value(
             value_os,
             completer.value_candidates(),
         ));
-    } else if let Some(possible_values) = possible_values(arg) {
-        if let Ok(value) = value {
-            values.extend(complete_candidates_str(
-                value,
-                possible_value_candidates(possible_values),
-            ));
-        }
     } else {
-        match arg.get_value_hint() {
-            clap::ValueHint::Unknown | clap::ValueHint::Other => {
-                // Should not complete
-            }
-            clap::ValueHint::AnyPath => {
-                values.extend(complete_path(value_os, current_dir, &|_| true));
-            }
-            clap::ValueHint::FilePath => {
-                values.extend(complete_path(value_os, current_dir, &|p| p.is_file()));
-            }
-            clap::ValueHint::DirPath => {
-                values.extend(complete_path(value_os, current_dir, &|p| p.is_dir()));
-            }
-            clap::ValueHint::ExecutablePath => {
-                use is_executable::IsExecutable;
-                values.extend(complete_path(value_os, current_dir, &|p| p.is_executable()));
-            }
-            clap::ValueHint::CommandName
-            | clap::ValueHint::CommandString
-            | clap::ValueHint::CommandWithArguments
-            | clap::ValueHint::Username
-            | clap::ValueHint::Hostname
-            | clap::ValueHint::Url
-            | clap::ValueHint::EmailAddress => {
-                // No completion implementation
-            }
-            _ => {
-                // Safe-ish fallback
-                values.extend(complete_path(value_os, current_dir, &|_| true));
+        if let Some(possible_values) = possible_values(arg) {
+            if let Ok(value) = value {
+                values.extend(complete_candidates_str(
+                    value,
+                    possible_value_candidates(possible_values),
+                ));
             }
         }
-
-        values.sort();
+        // A path hint still adds file system candidates next to a fixed value
+        // set, mirroring shell generators that enable directory completion on
+        // top of the listed values (e.g. bash's `plusdirs`).
+        if let Some(is_wanted) = path_hint_filter(arg.get_value_hint()) {
+            values.extend(complete_path(value_os, current_dir, &is_wanted));
+        }
     }
 
     if let Some(prefix) = prefix {
@@ -967,6 +1059,31 @@ fn complete_arg_value(
 
     debug!("complete_arg_value: values={values:?}");
     values
+}
+
+/// Resolve a path [`clap::ValueHint`] to the file-system filter used for path
+/// completion; hints without a completion implementation return `None`.
+fn path_hint_filter(hint: clap::ValueHint) -> Option<fn(&std::path::Path) -> bool> {
+    fn is_any(_p: &std::path::Path) -> bool {
+        true
+    }
+    fn is_file(p: &std::path::Path) -> bool {
+        p.is_file()
+    }
+    fn is_dir(p: &std::path::Path) -> bool {
+        p.is_dir()
+    }
+    fn is_executable_path(p: &std::path::Path) -> bool {
+        use is_executable::IsExecutable;
+        p.is_executable()
+    }
+    match hint {
+        clap::ValueHint::AnyPath => Some(is_any),
+        clap::ValueHint::FilePath => Some(is_file),
+        clap::ValueHint::DirPath => Some(is_dir),
+        clap::ValueHint::ExecutablePath => Some(is_executable_path),
+        _ => None,
+    }
 }
 
 fn rsplit_delimiter<'s, 'o>(

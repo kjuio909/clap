@@ -1951,6 +1951,227 @@ fn suggest_spec_illegal_forms_error() {
     );
 }
 
+/// Build the command from the terminator spec: `--tag` with a visible alias
+/// `--label`, short `-t`, at most three comma-separated values from a fixed
+/// set ended by a standalone `;`; a conflicting value-less `--raw`; and a
+/// positional limited to `src`/`dst` that also completes directories.
+fn tag_command() -> Command {
+    Command::new("fmt")
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .visible_alias("label")
+                .short('t')
+                .num_args(1..=3)
+                .value_parser(["red", "green", "blue"])
+                .value_delimiter(',')
+                .value_terminator(";"),
+        )
+        .arg(
+            clap::Arg::new("raw")
+                .long("raw")
+                .action(clap::ArgAction::SetTrue)
+                .conflicts_with("tag"),
+        )
+        .arg(
+            clap::Arg::new("path")
+                .value_parser(["src", "dst"])
+                .value_hint(clap::ValueHint::DirPath),
+        )
+}
+
+#[test]
+fn suggest_tag_terminator_open_segments() {
+    // A dangling comma before the cursor keeps accepting segments: only the
+    // unused values are offered, never the selected `red`, option names or
+    // positionals. Every spelling of the option establishes the same state and
+    // keeps the prefix the caller is typing.
+    for input in [
+        "--tag=red, [TAB]",
+        "--label=red, [TAB]",
+        "-tred, [TAB]",
+        "-t=red, [TAB]",
+        "--tag red, [TAB]",
+    ] {
+        assert_data_eq!(
+            complete!(tag_command(), input),
+            snapbox::str![[r#"
+green
+blue
+"#]]
+        );
+    }
+
+    // The segment being edited filters on its own prefix only and keeps the
+    // exact option spelling; the unfinished word does not change any other set.
+    assert_data_eq!(
+        complete!(tag_command(), "--tag=red,g[TAB]"),
+        snapbox::str!["--tag=red,green"]
+    );
+    assert_data_eq!(
+        complete!(tag_command(), "--label=red,g[TAB]"),
+        snapbox::str!["--label=red,green"]
+    );
+    assert_data_eq!(
+        complete!(tag_command(), "-tred,b[TAB]"),
+        snapbox::str!["-tred,blue"]
+    );
+
+    // An already selected value never reappears, in any segment.
+    assert_data_eq!(complete!(tag_command(), "--tag=red,r[TAB]"), snapbox::str![""]);
+    assert_data_eq!(
+        complete!(tag_command(), "--tag red,green,b[TAB]"),
+        snapbox::str!["red,green,blue"]
+    );
+}
+
+#[test]
+fn suggest_tag_terminator_transition() {
+    // A consumed standalone `;` ends value taking: it is not a value and is not a
+    // candidate. The next empty word offers ordinary options and positionals
+    // again, with `raw` still suppressed.
+    assert_data_eq!(
+        complete!(tag_command(), "--tag red ; [TAB]"),
+        snapbox::str![[r#"
+src
+dst
+--tag
+--help	Print help
+"#]]
+    );
+    // The same state through two space-separated value words and an alias.
+    assert_data_eq!(
+        complete!(tag_command(), "--tag red green ; [TAB]"),
+        snapbox::str![[r#"
+src
+dst
+--tag
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(tag_command(), "--label red ; [TAB]"),
+        snapbox::str![[r#"
+src
+dst
+--tag
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(tag_command(), "-t red ; [TAB]"),
+        snapbox::str![[r#"
+src
+dst
+--tag
+--help	Print help
+"#]]
+    );
+
+    // While the cursor sits on the terminator itself nothing is offered: it is
+    // a transition word, not a value, option or positional.
+    assert_data_eq!(
+        complete!(tag_command(), "--tag red ;[TAB]"),
+        snapbox::str![""]
+    );
+
+    // `raw` stays suppressed after the transition: its long prefix offers
+    // nothing, and its short prefix only clusters the still-visible flags.
+    assert_data_eq!(complete!(tag_command(), "--tag red ; --r[TAB]"), snapbox::str![""]);
+    assert_data_eq!(
+        complete!(tag_command(), "--tag red ; -r[TAB]"),
+        snapbox::str![[r#"
+-rt	--tag
+-rh	Print help
+"#]]
+    );
+}
+
+#[test]
+fn suggest_tag_terminator_then_escape() {
+    let testdir = spec_tempdir();
+    let path = testdir.path().unwrap();
+
+    // After the terminator and `--`, only the positional's fixed values and
+    // directory candidates (sorted by the existing rules) remain.
+    assert_data_eq!(
+        complete!(tag_command(), "--tag red ; -- [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+src
+dst
+.
+a_dir/
+b_dir/
+"#]]
+    );
+    assert_data_eq!(
+        complete!(tag_command(), "--tag red ; -- s[TAB]", current_dir = Some(path)),
+        snapbox::str!["src"]
+    );
+    assert_data_eq!(
+        complete!(tag_command(), "--tag red ; -- a[TAB]", current_dir = Some(path)),
+        snapbox::str!["a_dir/"]
+    );
+    // No option leaks past `--`, and `raw` stays suppressed there too.
+    assert_data_eq!(
+        complete!(tag_command(), "--tag red ; -- --r[TAB]", current_dir = Some(path)),
+        snapbox::str![""]
+    );
+}
+
+#[test]
+fn suggest_tag_terminator_illegal_forms() {
+    // The terminator needs at least the required values: a bare `--tag ;`
+    // cannot end an empty occurrence.
+    assert_eq!(
+        complete_err(&mut tag_command(), "--tag ; [TAB]"),
+        "no completion generated"
+    );
+
+    // A dangling comma opened an empty segment that `;` cannot close.
+    for input in ["--tag=red, ; [TAB]", "-tred, ; [TAB]", "--tag red, ; [TAB]"] {
+        assert_eq!(complete_err(&mut tag_command(), input), "no completion generated");
+    }
+
+    // Unknown values and overfull value sets stay illegal.
+    for input in [
+        "--tag junk [TAB]",
+        "--tag red junk [TAB]",
+        "--tag=junk [TAB]",
+        "--tag=red,green,blue,[TAB]",
+        "--tag red,, [TAB]",
+        "--tag=red,,;[TAB]",
+    ] {
+        assert_eq!(complete_err(&mut tag_command(), input), "no completion generated");
+    }
+
+    // A repeated standalone terminator and a terminator glued to other text
+    // after the transition cannot be guessed at.
+    for input in [
+        "--tag red ; ; [TAB]",
+        "--tag red ; ;[TAB]",
+        "--tag red ; ;x[TAB]",
+        "--tag red ; x;[TAB]",
+    ] {
+        assert_eq!(complete_err(&mut tag_command(), input), "no completion generated");
+    }
+
+    // A terminator glued into a value word is neither a value nor a
+    // terminator, whichever spelling carries it, whether it is a separate word
+    // or still part of the option word under the cursor.
+    for input in [
+        "--tag red; [TAB]",
+        "--tag=red; [TAB]",
+        "-tred; [TAB]",
+        "--label=red; [TAB]",
+        "--tag=red;[TAB]",
+        "-tred;[TAB]",
+        "--tag=red;x[TAB]",
+    ] {
+        assert_eq!(complete_err(&mut tag_command(), input), "no completion generated");
+    }
+}
+
 fn complete_values(
     cmd: &mut Command,
     args: Vec<std::ffi::OsString>,
