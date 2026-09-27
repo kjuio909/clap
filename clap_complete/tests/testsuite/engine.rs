@@ -874,6 +874,117 @@ baz
 }
 
 #[test]
+fn suggest_custom_arg_value_aliases_and_multicall() {
+    fn name_candidates() -> Vec<CompletionCandidate> {
+        vec![
+            CompletionCandidate::new("alice"),
+            CompletionCandidate::new("alina"),
+            CompletionCandidate::new("bob"),
+        ]
+    }
+
+    fn inspect_command() -> Command {
+        Command::new("inspect")
+            .alias("i")
+            .arg(
+                clap::Arg::new("name")
+                    .long("name")
+                    .add(ArgValueCandidates::new(name_candidates)),
+            )
+            .arg(
+                clap::Arg::new("format")
+                    .long("format")
+                    .value_parser(["json", "yaml"]),
+            )
+            .arg(clap::Arg::new("query").value_parser(["all", "changed"]))
+    }
+
+    fn tool_command() -> Command {
+        Command::new("tool").subcommand(inspect_command())
+    }
+
+    fn multicall_command() -> Command {
+        Command::new("tool")
+            .multicall(true)
+            .subcommand(Command::new("busybox").defer(|cmd| cmd.subcommand(inspect_command())))
+            .subcommand(inspect_command())
+    }
+
+    // Call `clap_complete::engine::complete` with a full argv (including argv0);
+    // the cursor is on the last token.
+    fn complete_argv(cmd: &mut Command, argv: &[&str]) -> Vec<String> {
+        clap_complete::engine::complete(
+            cmd,
+            argv.iter().map(std::ffi::OsString::from).collect(),
+            argv.len() - 1,
+            None,
+        )
+        .unwrap()
+        .into_iter()
+        .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+        .collect()
+    }
+
+    // (argv suffix after the token that resolves to `inspect`, expected candidates)
+    let cases: &[(&[&str], &[&str])] = &[
+        (&["--name", ""], &["alice", "alina", "bob"]),
+        (&["--name", "al"], &["alice", "alina"]),
+        (&["--name", "z"], &[]),
+        (&["--name=al"], &["--name=alice", "--name=alina"]),
+        (&["--name", "alice", "--name", ""], &["alice", "alina", "bob"]),
+        (&["--name", "alice", "--name", "al"], &["alice", "alina"]),
+        (&["--format", ""], &["json", "yaml"]),
+        (&["--format", "j"], &["json"]),
+        (&["--", ""], &["all", "changed"]),
+    ];
+
+    // Every entry point that resolves to `tool inspect` must produce
+    // item-by-item identical candidates, in the same order.
+    let entry_points: Vec<(Command, &[&str])> = vec![
+        (tool_command(), &["tool", "inspect"]),
+        (tool_command(), &["tool", "i"]),
+        (multicall_command(), &["/usr/bin/inspect"]),
+        (multicall_command(), &["/opt/bin/i.exe"]),
+        (multicall_command(), &["/usr/bin/busybox", "inspect"]),
+    ];
+
+    for (mut cmd, prefix) in entry_points {
+        for (suffix, expected) in cases {
+            let argv: Vec<&str> = prefix.iter().chain(suffix.iter()).copied().collect();
+            let actual = complete_argv(&mut cmd, &argv);
+            assert_eq!(actual, *expected, "argv={argv:?}");
+        }
+    }
+
+    // Unknown aliases, options, invocation names, and invalid prefixes
+    // complete to nothing rather than falling back to another command's
+    // candidates.
+    let empty_cases: Vec<(Command, &[&str])> = vec![
+        // Unknown subcommand / alias
+        (tool_command(), &["tool", "bogus"]),
+        (multicall_command(), &["/usr/bin/busybox", "bogus"]),
+        // Unknown option
+        (tool_command(), &["tool", "inspect", "--bogus"]),
+        (tool_command(), &["tool", "i", "--bogus"]),
+        (multicall_command(), &["/usr/bin/inspect", "--bogus"]),
+        // Unknown multicall invocation names must not fall back to
+        // the root command's candidates
+        (multicall_command(), &["/usr/bin/bogus", "--name", ""]),
+        (multicall_command(), &["/opt/bin/bogus.exe", "--name", ""]),
+        (multicall_command(), &["/usr/bin/busybox", "bogus", "--name", ""]),
+        // Invalid value prefixes
+        (tool_command(), &["tool", "inspect", "--name", "z"]),
+        (multicall_command(), &["/usr/bin/inspect", "--name", "z"]),
+        (multicall_command(), &["/usr/bin/inspect", "--name=z"]),
+    ];
+
+    for (mut cmd, argv) in empty_cases {
+        let actual = complete_argv(&mut cmd, argv);
+        assert_eq!(actual, Vec::<String>::new(), "argv={argv:?}");
+    }
+}
+
+#[test]
 fn suggest_custom_arg_completer() {
     fn custom_completer(current: &std::ffi::OsStr) -> Vec<CompletionCandidate> {
         let mut completions = vec![];

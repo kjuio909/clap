@@ -32,12 +32,31 @@ pub fn complete(
     raw_args.next_os(&mut target_cursor);
     debug!("complete: target_cursor={target_cursor:?}");
 
-    // TODO: Multicall support
-    if !cmd.is_no_binary_name_set() {
+    let mut current_cmd = &*cmd;
+    if cmd.is_multicall_set() {
+        // A multicall binary dispatches on argv0: its file stem selects the
+        // subcommand ("applet") whose arguments are being completed.
+        let argv0 = raw_args.next_os(&mut cursor);
+        if cursor == target_cursor {
+            // Completing the applet name itself
+            let prefix = argv0
+                .and_then(|argv0| std::path::Path::new(argv0).file_stem())
+                .and_then(|stem| stem.to_str())
+                .unwrap_or("");
+            return Ok(post_process(complete_subcommand(prefix, cmd)));
+        }
+        let applet = argv0
+            .and_then(|argv0| std::path::Path::new(argv0).file_stem())
+            .and_then(|stem| stem.to_str());
+        let Some(subcommand) = applet.and_then(|applet| cmd.find_subcommand(applet)) else {
+            // Unknown applet; don't fall back to the root command's candidates
+            return Ok(Vec::new());
+        };
+        current_cmd = subcommand;
+    } else if !cmd.is_no_binary_name_set() {
         raw_args.next_os(&mut cursor);
     }
 
-    let mut current_cmd = &*cmd;
     let mut pos_index = 1;
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
@@ -96,6 +115,9 @@ pub fn complete(
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
+                } else {
+                    // Unknown option; clap would error, so don't complete
+                    return Ok(Vec::new());
                 }
             }
         } else if let Some(short) = arg.to_short() {
@@ -111,6 +133,15 @@ pub fn complete(
         } else {
             match current_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
+                    if !current_cmd.is_allow_external_subcommands_set()
+                        && !current_cmd
+                            .get_positionals()
+                            .any(|p| p.get_index() == Some(pos_index))
+                    {
+                        // Unknown argument or subcommand; clap would error, so don't
+                        // fall back to the current command's candidates
+                        return Ok(Vec::new());
+                    }
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
@@ -214,6 +245,10 @@ fn complete_arg(
             }
         }
     }
+    Ok(post_process(completions))
+}
+
+fn post_process(mut completions: Vec<CompletionCandidate>) -> Vec<CompletionCandidate> {
     if completions.iter().any(|a| !a.is_hide_set()) {
         completions.retain(|a| !a.is_hide_set());
     }
@@ -240,7 +275,7 @@ fn complete_arg(
         )
     });
 
-    Ok(completions)
+    completions
 }
 
 fn complete_option(
