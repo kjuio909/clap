@@ -1897,6 +1897,36 @@ fn suggest_tag_terminator_illegal_forms_error() {
     }
 }
 
+#[test]
+fn suggest_tag_terminator_repeated_calls_are_stable() {
+    // Repeated calls on the same command definition neither accumulate state
+    // nor mutate it: the same input completes identically every time, a
+    // terminator consumed by an earlier call does not reopen value taking in
+    // a later one, and an error result does not poison later calls.
+    let mut cmd = terminator_command();
+    let after = snapbox::str![[r#"
+src
+dst
+--tag
+--help	Print help
+"#]];
+    for _ in 0..2 {
+        assert_data_eq!(complete!(cmd, "--tag red ; [TAB]"), after.clone());
+    }
+    assert_eq!(
+        complete_err(&mut cmd, "--tag red ; ; [TAB]"),
+        "no completion generated"
+    );
+    assert_data_eq!(complete!(cmd, "--tag red ; [TAB]"), after.clone());
+    assert_data_eq!(
+        complete!(cmd, "--tag=red, [TAB]"),
+        snapbox::str![[r#"
+green
+blue
+"#]]
+    );
+}
+
 /// Build the command from the task spec: a two-value comma-delimited
 /// `--format` (visible alias + short) with both a default and an env source,
 /// a conflicting `--raw` (visible alias + short) and a directory positional.
