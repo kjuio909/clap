@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use clap::{builder::PossibleValue, Command};
+use clap::{Command, builder::PossibleValue};
 use clap_complete::engine::{
     ArgValueCandidates, ArgValueCompleter, CompletionCandidate, PathCompleter, SubcommandCandidates,
 };
@@ -720,7 +720,11 @@ real_dir/
 
     // Should be able to complete through the symlink
     assert_data_eq!(
-        complete!(cmd, "--input link_dir/[TAB]", current_dir = Some(testdir_path)),
+        complete!(
+            cmd,
+            "--input link_dir/[TAB]",
+            current_dir = Some(testdir_path)
+        ),
         snapbox::str!["link_dir/file.txt"],
     );
 }
@@ -1547,6 +1551,7 @@ fn inspect_command() -> Command {
         .arg(
             clap::Arg::new("name")
                 .long("name")
+                .action(clap::ArgAction::Append)
                 .add(ArgValueCandidates::new(name_candidates)),
         )
         .arg(
@@ -1599,7 +1604,10 @@ fn suggest_custom_arg_value_candidates_via_alias() {
         expected
     );
     // The alias entry point must produce identical candidates, in order
-    assert_eq!(complete_argv(&mut cmd, &["tool", "i", "--name", ""]), expected);
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "i", "--name", ""]),
+        expected
+    );
 
     let expected = vec!["alice", "alina"];
     assert_eq!(
@@ -1620,7 +1628,10 @@ fn suggest_custom_arg_value_candidates_via_alias() {
         complete_argv(&mut cmd, &["tool", "inspect", "--name=al"]),
         expected
     );
-    assert_eq!(complete_argv(&mut cmd, &["tool", "i", "--name=al"]), expected);
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "i", "--name=al"]),
+        expected
+    );
 
     // A repeated `--name` still resolves to the same provider, without
     // leaking `--format` or positional values
@@ -1751,7 +1762,10 @@ fn suggest_hidden_items_custom_values_deduped() {
         complete_argv(&mut cmd, &["tool", "inspect", "--name", ""]),
         expected
     );
-    assert_eq!(complete_argv(&mut cmd, &["tool", "i", "--name", ""]), expected);
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "i", "--name", ""]),
+        expected
+    );
 
     let expected = vec!["alice", "alina"];
     assert_eq!(
@@ -1769,9 +1783,7 @@ fn suggest_hidden_items_not_offered_on_empty_prefix() {
     let mut cmd = custom_candidates_command();
 
     // Only public options and public paths: no `--internal`, no `debug`
-    let expected = vec![
-        "help", "all", "changed", "--name", "--format", "--help",
-    ];
+    let expected = vec!["help", "all", "changed", "--name", "--format", "--help"];
     assert_eq!(complete_argv(&mut cmd, &["tool", "inspect", ""]), expected);
     assert_eq!(complete_argv(&mut cmd, &["tool", "i", ""]), expected);
 }
@@ -1827,6 +1839,276 @@ fn suggest_hidden_items_unknown_paths_empty() {
     assert!(complete_argv(&mut cmd, &["tool", "inspect", "deb", "--", ""]).is_empty());
     assert!(complete_argv(&mut cmd, &["tool", "i", "--int", "--format", ""]).is_empty());
     assert!(complete_argv(&mut cmd, &["tool", "i", "deb", "--", ""]).is_empty());
+}
+
+/// Root command for the interleaved optional/required value option scenarios.
+///
+/// `--color` is a repeatable option with an *optional* value (it may stand on
+/// its own), `--format` requires a value, and `files` is a repeatable
+/// positional.
+fn interleaved_value_command() -> Command {
+    Command::new("tool")
+        .arg(
+            clap::Arg::new("color")
+                .long("color")
+                .action(clap::ArgAction::Append)
+                .num_args(0..=1)
+                .value_parser(["auto", "always", "never"]),
+        )
+        .arg(
+            clap::Arg::new("format")
+                .long("format")
+                .required(true)
+                .value_parser(["json", "yaml"]),
+        )
+        .arg(
+            clap::Arg::new("files")
+                .action(clap::ArgAction::Append)
+                .value_parser(["a.txt", "b.txt"]),
+        )
+}
+
+#[test]
+fn suggest_interleaved_value_options() {
+    let colors = vec!["auto", "always", "never"];
+    let eq_colors = vec!["--color=auto", "--color=always", "--color=never"];
+    let formats = vec!["json", "yaml"];
+
+    // The value position of an optional-value option serves only that option's
+    // candidates.
+    assert_eq!(
+        complete_argv(&mut interleaved_value_command(), &["tool", "--color", ""]),
+        colors
+    );
+    assert_eq!(
+        complete_argv(&mut interleaved_value_command(), &["tool", "--color", "au"]),
+        vec!["auto"]
+    );
+    assert_eq!(
+        complete_argv(&mut interleaved_value_command(), &["tool", "--color="]),
+        eq_colors
+    );
+    assert_eq!(
+        complete_argv(&mut interleaved_value_command(), &["tool", "--color=au"]),
+        vec!["--color=auto"]
+    );
+
+    // The required-value option behaves the same way.
+    assert_eq!(
+        complete_argv(&mut interleaved_value_command(), &["tool", "--format", ""]),
+        formats
+    );
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--format", "ya"]
+        ),
+        vec!["yaml"]
+    );
+    assert_eq!(
+        complete_argv(&mut interleaved_value_command(), &["tool", "--format=ya"]),
+        vec!["--format=yaml"]
+    );
+
+    // `--color` followed directly by another option treats the optional value
+    // as omitted; the cursor serves `--format` only, with no color values.
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color", "--format", ""]
+        ),
+        formats
+    );
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color", "--format", "js"]
+        ),
+        vec!["json"]
+    );
+
+    // A committed empty inline value (`--color=`) is a finished, invalid value;
+    // it cannot be retried as the following option's prefix, so color values
+    // never leak into the format completion.
+    assert!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color=", "--format", "js"]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color=jx", "--format", ""]
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn suggest_repeated_optional_value_option() {
+    let colors = vec!["auto", "always", "never"];
+    let eq_colors = vec!["--color=auto", "--color=always", "--color=never"];
+
+    // Every occurrence of a repeatable option offers the full candidate set in
+    // declaration order; previous values never narrow later candidates.
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color", "auto", "--color", ""]
+        ),
+        colors
+    );
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color=auto", "--color", ""]
+        ),
+        colors
+    );
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color=auto", "--color="]
+        ),
+        eq_colors
+    );
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color", "auto", "--color=au"]
+        ),
+        vec!["--color=auto"]
+    );
+
+    // The independent and attached spellings produce the same candidates at the
+    // same value position, differing only by the `--color=` prefix.
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color", "auto", "--color", ""]
+        ),
+        colors
+    );
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color=auto", "--color="]
+        ),
+        eq_colors
+    );
+}
+
+#[test]
+fn suggest_value_options_after_escape() {
+    // After `--`, only positional `files` values are completed, even when the
+    // token under the cursor looks like an option.
+    assert_eq!(
+        complete_argv(&mut interleaved_value_command(), &["tool", "--", ""]),
+        vec!["a.txt", "b.txt"]
+    );
+    assert_eq!(
+        complete_argv(&mut interleaved_value_command(), &["tool", "--", "a"]),
+        vec!["a.txt"]
+    );
+    assert!(complete_argv(&mut interleaved_value_command(), &["tool", "--", "--color"]).is_empty());
+    assert!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--", "--format"]
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn suggest_value_options_invalid_lines_empty() {
+    // Unknown options never fall back to root command candidates.
+    assert!(complete_argv(&mut interleaved_value_command(), &["tool", "--bogus", ""]).is_empty());
+
+    // An illegal value already committed invalidates the command line, whether
+    // the value was attached or independent.
+    assert!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color", "red", "--format", ""]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color=red", "--format", ""]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "a.txt", "--format", "bad", ""]
+        )
+        .is_empty()
+    );
+    assert!(complete_argv(&mut interleaved_value_command(), &["tool", "c.txt", ""]).is_empty());
+
+    // A required-value option followed by another option is missing its value.
+    assert!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--format", "--color", "au"]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--format", "--color"]
+        )
+        .is_empty()
+    );
+
+    // A non-repeatable option cannot take values a second time.
+    assert!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--format", "json", "--format", ""]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--format=json", "--format=ya"]
+        )
+        .is_empty()
+    );
+
+    // An unfinished attached value is only valid while it holds the cursor.
+    assert!(
+        complete_argv(
+            &mut interleaved_value_command(),
+            &["tool", "--color=au", ""]
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn suggest_value_options_state_isolated_across_calls() {
+    let mut cmd = interleaved_value_command();
+    let colors = vec!["auto", "always", "never"];
+
+    // A failed completion leaves no residue: the next call starts from the
+    // same command in a fresh state.
+    assert!(complete_argv(&mut cmd, &["tool", "--bogus", ""]).is_empty());
+    assert_eq!(complete_argv(&mut cmd, &["tool", "--color", ""]), colors);
+    assert!(complete_argv(&mut cmd, &["tool", "--color=bad"]).is_empty());
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "--color=au"]),
+        vec!["--color=auto"]
+    );
+    assert_eq!(complete_argv(&mut cmd, &["tool", "--color", ""]), colors);
 }
 
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {

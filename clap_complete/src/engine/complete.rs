@@ -61,6 +61,9 @@ pub fn complete(
     let mut pos_index = 1;
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
+    // Options that already took their values on this command line, used to
+    // reject a repeated occurrence of a non-repeatable option.
+    let mut seen_options = std::collections::HashSet::<String>::new();
     while let Some(arg) = raw_args.next(&mut cursor) {
         let current_state = next_state;
         next_state = ParseState::ValueDone;
@@ -76,6 +79,7 @@ pub fn complete(
                 pos_index,
                 is_escaped,
                 current_state,
+                &seen_options,
             );
         }
 
@@ -83,18 +87,60 @@ pub fn complete(
             if let Some(next_cmd) = current_cmd.find_subcommand(value) {
                 current_cmd = next_cmd;
                 pos_index = 1;
+                seen_options.clear();
                 continue;
             }
         }
 
+        // An option whose value is required cannot be followed by another
+        // option or the escape token; the missing value makes the whole
+        // command line invalid, so nothing can be completed. An option whose
+        // value is optional instead drops its pending state and the token is
+        // processed on its own.
+        if !is_escaped && looks_like_option(&arg) {
+            if let ParseState::Opt((opt, count)) = &current_state {
+                let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
+                if *count <= min && min > 0 && !opt.is_allow_hyphen_values_set() {
+                    debug!(
+                        "complete: missing required value for opt={:?}",
+                        opt.get_id()
+                    );
+                    return Ok(Vec::new());
+                }
+            }
+        }
+
         if is_escaped {
+            let positional = current_cmd
+                .get_positionals()
+                .find(|p| p.get_index() == Some(pos_index));
+            if let Some(positional) = positional {
+                if !is_valid_value(positional, arg.to_value_os()) {
+                    debug!(
+                        "complete: invalid value={:?} for positional={:?}",
+                        arg.to_value_os(),
+                        positional.get_id()
+                    );
+                    return Ok(Vec::new());
+                }
+            }
             (next_state, pos_index) =
                 parse_positional(current_cmd, pos_index, is_escaped, current_state);
         } else if arg.is_escape() {
             is_escaped = true;
         } else if opt_allows_hyphen(&current_state, &arg) {
             match current_state {
-                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                ParseState::Opt((opt, count)) => {
+                    if !is_valid_value(opt, arg.to_value_os()) {
+                        debug!(
+                            "complete: invalid value={:?} for opt={:?}",
+                            arg.to_value_os(),
+                            opt.get_id()
+                        );
+                        return Ok(Vec::new());
+                    }
+                    next_state = parse_opt_value(opt, count);
+                }
                 _ => unreachable!("else branch is only reachable in Opt state"),
             }
         } else if let Some((flag, value)) = arg.to_long() {
@@ -110,10 +156,36 @@ pub fn complete(
                 });
 
                 if let Some(opt) = opt {
-                    if opt.get_num_args().expect("built").takes_values() && value.is_none() {
+                    let takes_values = opt.get_num_args().expect("built").takes_values();
+                    if takes_values {
+                        if !can_repeat(opt) && !seen_options.insert(opt.get_id().to_string()) {
+                            debug!("complete: repeated non-repeatable opt={flag:?}");
+                            return Ok(Vec::new());
+                        }
+                        if let Some(value) = value {
+                            if !is_valid_value(opt, value) {
+                                debug!("complete: invalid value={value:?} for opt={flag:?}");
+                                return Ok(Vec::new());
+                            }
+                        }
+                    }
+                    if takes_values && value.is_none() {
                         next_state = ParseState::Opt((opt, 1));
                     };
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
+                    let positional = current_cmd
+                        .get_positionals()
+                        .find(|p| p.get_index() == Some(pos_index));
+                    if let Some(positional) = positional {
+                        if !is_valid_value(positional, arg.to_value_os()) {
+                            debug!(
+                                "complete: invalid value={:?} for positional={:?}",
+                                arg.to_value_os(),
+                                positional.get_id()
+                            );
+                            return Ok(Vec::new());
+                        }
+                    }
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 } else {
@@ -124,27 +196,77 @@ pub fn complete(
         } else if let Some(short) = arg.to_short() {
             let (_, takes_value_opt, mut short) = parse_shortflags(current_cmd, short);
             if let Some(opt) = takes_value_opt {
-                if short.next_value_os().is_none() {
+                if !can_repeat(opt) && !seen_options.insert(opt.get_id().to_string()) {
+                    debug!("complete: repeated non-repeatable opt={:?}", opt.get_id());
+                    return Ok(Vec::new());
+                }
+                // Consume an optional `=`, matching how inline short values are
+                // split elsewhere, so `-F=json` validates `json` rather than
+                // `=json`.
+                let mut peek_short = short.clone();
+                if let Some(Ok('=')) = peek_short.next_flag() {
+                    short.next_flag();
+                }
+                if let Some(value) = short.next_value_os() {
+                    if !is_valid_value(opt, value) {
+                        debug!(
+                            "complete: invalid value={value:?} for opt={:?}",
+                            opt.get_id()
+                        );
+                        return Ok(Vec::new());
+                    }
+                } else {
                     next_state = ParseState::Opt((opt, 1));
                 }
             } else if pos_allows_hyphen(current_cmd, pos_index) {
+                let positional = current_cmd
+                    .get_positionals()
+                    .find(|p| p.get_index() == Some(pos_index));
+                if let Some(positional) = positional {
+                    if !is_valid_value(positional, arg.to_value_os()) {
+                        debug!(
+                            "complete: invalid value={:?} for positional={:?}",
+                            arg.to_value_os(),
+                            positional.get_id()
+                        );
+                        return Ok(Vec::new());
+                    }
+                }
                 (next_state, pos_index) =
                     parse_positional(current_cmd, pos_index, is_escaped, current_state);
             }
         } else {
             match current_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
-                    if current_cmd
+                    let positional = current_cmd
                         .get_positionals()
-                        .all(|p| p.get_index() != Some(pos_index))
-                    {
+                        .find(|p| p.get_index() == Some(pos_index));
+                    let Some(positional) = positional else {
                         debug!("complete: unrecognized argument={:?}", arg.to_value_os());
+                        return Ok(Vec::new());
+                    };
+                    if !is_valid_value(positional, arg.to_value_os()) {
+                        debug!(
+                            "complete: invalid value={:?} for positional={:?}",
+                            arg.to_value_os(),
+                            positional.get_id()
+                        );
                         return Ok(Vec::new());
                     }
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
-                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                ParseState::Opt((opt, count)) => {
+                    if !is_valid_value(opt, arg.to_value_os()) {
+                        debug!(
+                            "complete: invalid value={:?} for opt={:?}",
+                            arg.to_value_os(),
+                            opt.get_id()
+                        );
+                        return Ok(Vec::new());
+                    }
+                    next_state = parse_opt_value(opt, count);
+                }
             }
         }
     }
@@ -171,6 +293,7 @@ fn complete_arg(
     pos_index: usize,
     is_escaped: bool,
     state: ParseState<'_>,
+    seen_options: &std::collections::HashSet<String>,
 ) -> Result<Vec<CompletionCandidate>, std::io::Error> {
     debug!(
         "complete_arg: arg={:?}, cmd={:?}, current_dir={:?}, pos_index={:?}, state={:?}",
@@ -180,6 +303,24 @@ fn complete_arg(
         pos_index,
         state
     );
+
+    // A token under the cursor may itself repeat an option that already took a
+    // value; for a non-repeatable option this is invalid and yields nothing.
+    if !is_escaped && matches!(state, ParseState::ValueDone | ParseState::Pos(..)) {
+        if let Some(opt) = cursor_option(cmd, arg) {
+            if opt.get_num_args().expect("built").takes_values()
+                && !can_repeat(opt)
+                && seen_options.contains(&opt.get_id().to_string())
+            {
+                debug!(
+                    "complete: repeated non-repeatable opt={:?} at cursor",
+                    opt.get_id()
+                );
+                return Ok(Vec::new());
+            }
+        }
+    }
+
     let mut completions = Vec::<CompletionCandidate>::new();
 
     match state {
@@ -235,7 +376,13 @@ fn complete_arg(
                 count.saturating_sub(1),
             ));
             let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
-            if count > min {
+            // An option whose value is optional (a minimum of zero values)
+            // always serves its own value at the first value slot; falling back
+            // to flags and positionals here would let `--color <TAB>` mix
+            // color values with unrelated candidates. Options that require at
+            // least one value keep offering the alternatives once their
+            // required values have been supplied.
+            if count > min && min > 0 {
                 // Also complete this raw_arg as a positional argument, flags, options and subcommand.
                 completions.extend(complete_arg(
                     arg,
@@ -244,6 +391,7 @@ fn complete_arg(
                     pos_index,
                     is_escaped,
                     ParseState::ValueDone,
+                    seen_options,
                 )?);
             }
         }
@@ -769,4 +917,68 @@ fn opt_allows_hyphen(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> b
     }
 
     false
+}
+
+/// Whether a committed token looks like an option or the escape token rather
+/// than a plain value.
+fn looks_like_option(arg: &clap_lex::ParsedArg<'_>) -> bool {
+    arg.is_escape()
+        || arg.to_long().is_some_and(|(flag, _)| flag.is_ok())
+        || arg
+            .to_short()
+            .is_some_and(|short| !short.is_negative_number())
+}
+
+/// Whether the argument may occur more than once on a command line, taking an
+/// additional value each time.
+fn can_repeat(arg: &clap::Arg) -> bool {
+    matches!(
+        arg.get_action(),
+        clap::ArgAction::Append | clap::ArgAction::Count
+    )
+}
+
+/// Resolve the option named by a cursor token, if it is a recognizable long or
+/// short option.
+fn cursor_option<'c>(
+    cmd: &'c clap::Command,
+    arg: &clap_lex::ParsedArg<'_>,
+) -> Option<&'c clap::Arg> {
+    if let Some((flag, _)) = arg.to_long() {
+        let flag = flag.ok()?;
+        cmd.get_arguments().find(|a| {
+            a.get_long_and_visible_aliases()
+                .map(|longs| longs.into_iter().any(|long| long == flag))
+                .unwrap_or(false)
+        })
+    } else if let Some(short) = arg.to_short() {
+        let (_, opt, _) = parse_shortflags(cmd, short);
+        opt
+    } else {
+        None
+    }
+}
+
+/// Validate a value already committed on the command line (not the token under
+/// the cursor). Unlike the token being completed, a finished value must match
+/// one of the argument's possible values exactly; an unfinished or illegal
+/// value invalidates the whole command line and yields no candidates.
+fn is_valid_value(arg: &clap::Arg, value: &OsStr) -> bool {
+    let Some(possible) = possible_values(arg) else {
+        return true;
+    };
+    let Some(value) = value.to_str() else {
+        return false;
+    };
+    let possible: Vec<clap::builder::PossibleValue> = possible.collect();
+    let matches = |part: &str| {
+        possible
+            .iter()
+            .flat_map(|p| p.get_name_and_aliases())
+            .any(|name| name == part)
+    };
+    match arg.get_value_delimiter() {
+        Some(delimiter) => value.split(delimiter).all(matches),
+        None => matches(value),
+    }
 }
