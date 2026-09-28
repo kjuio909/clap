@@ -99,11 +99,24 @@ pub fn complete(
         }
 
         if let Ok(value) = arg.to_value() {
-            // A dangling delimiter forces this word to be the option's next
-            // segment, never a subcommand.
-            let open_segment = matches!(&current_state, ParseState::Opt(state) if state.open);
-            if !open_segment {
-                if let Some(next_cmd) = current_cmd.find_subcommand(value) {
+            // Subcommands are only recognized at a fresh word of the current
+            // layer, never while actively filling an option value, a multi-word
+            // positional or after `--`, mirroring clap's parser. An option
+            // occurrence that already closed through an attached value still
+            // accepts its standalone terminator as this word, but any other
+            // word resumes at the top of the layer.
+            let at_layer_top = matches!(current_state, ParseState::ValueDone)
+                || matches!(&current_state, ParseState::Opt(state) if state.closed);
+            if !is_escaped && at_layer_top {
+                // A committed word selects the parsing layer exactly the way
+                // clap's parser does with subcommand inference: an exact name
+                // or alias always wins (even over a positional of the same
+                // text), otherwise a unique name/alias prefix enters that
+                // subcommand. A prefix shared by several subcommands resolves
+                // to nothing here; the word then has to stand on its own as a
+                // positional value below, and if it cannot, the line is
+                // illegal instead of guessing a branch.
+                if let Some(next_cmd) = resolve_subcommand(current_cmd, value) {
                     current_cmd = next_cmd;
                     pos_index = 1;
                     last_terminator = None;
@@ -163,7 +176,18 @@ pub fn complete(
             current_state
         };
 
+        // A closed word must be part of a valid command line at the layer the
+        // earlier words selected. Unlike the word under the cursor (which is
+        // still being typed and is merely filtered), a committed word can make
+        // the whole line uncompletable: an unknown option or a value that the
+        // positional's fixed value set rejects. When that happens completion
+        // reports "no completion generated" rather than silently dropping the
+        // word, which would leak candidates from an unrelated layer.
+        let positional_slot = pos_index;
+        let mut consumed_as_positional = false;
+
         if is_escaped {
+            consumed_as_positional = true;
             (next_state, pos_index) =
                 parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
         } else if arg.is_escape() {
@@ -203,9 +227,17 @@ pub fn complete(
                             }
                         }
                     }
+                } else if long_arg_exists(current_cmd, flag) {
+                    // A hidden long alias is accepted exactly like the parser,
+                    // it just stays undiscoverable as a candidate.
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
+                    consumed_as_positional = true;
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
+                } else {
+                    // An unknown long option in a closed word cannot be part of
+                    // any valid command line.
+                    is_illegal = true;
                 }
             }
         } else if let Some(short) = arg.to_short() {
@@ -237,12 +269,14 @@ pub fn complete(
                     next_state = ParseState::Opt(OptState::new(opt, 1));
                 }
             } else if pos_allows_hyphen(current_cmd, pos_index) {
+                consumed_as_positional = true;
                 (next_state, pos_index) =
                     parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
             }
         } else {
             match dispatch_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
+                    consumed_as_positional = true;
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
                 }
@@ -250,6 +284,13 @@ pub fn complete(
                     next_state = advance_opt_value(state, arg.to_value_os(), &mut is_illegal);
                 }
             }
+        }
+
+        if consumed_as_positional
+            && !is_illegal
+            && positional_value_is_illegal(current_cmd, positional_slot, arg.to_value_os())
+        {
+            is_illegal = true;
         }
 
         // Remember a just-consumed terminator for exactly one word so a
@@ -1158,6 +1199,35 @@ fn complete_value_candidates_str(
     complete_candidates_str(value, completer.candidates())
 }
 
+/// Resolve a *closed* word to the subcommand it enters at the current layer.
+///
+/// This mirrors clap's parser with subcommand inference enabled:
+/// - an exact name or alias always wins, even when several prefixes would
+///   otherwise match (so `remote` enters `remote`, never the positional value);
+/// - otherwise a unique prefix of a visible or hidden name/alias enters that
+///   subcommand;
+/// - a prefix shared by several subcommands resolves to nothing, the caller
+///   then treats the word as a positional and reports "no completion" rather
+///   than guessing a branch.
+///
+/// Hidden names/aliases participate in the inference but only prefix matches
+/// are considered for them, matching how the parser's inference collects
+/// every alias before the exact lookup decides.
+fn resolve_subcommand<'c>(cmd: &'c clap::Command, value: &str) -> Option<&'c clap::Command> {
+    if let Some(exact) = cmd.find_subcommand(value) {
+        return Some(exact);
+    }
+    let mut prefixes = cmd.get_subcommands().filter(|s| {
+        s.get_name().starts_with(value) || s.get_all_aliases().any(|alias| alias.starts_with(value))
+    });
+    let unique = prefixes.next()?;
+    if prefixes.next().is_none() {
+        Some(unique)
+    } else {
+        None
+    }
+}
+
 fn complete_subcommand(value: &str, cmd: &clap::Command) -> Vec<CompletionCandidate> {
     debug!(
         "complete_subcommand: cmd={:?}, value={:?}",
@@ -1270,6 +1340,55 @@ fn possible_values(
     } else {
         a.get_value_parser().possible_values()
     }
+}
+
+/// Whether a long option named `flag` exists on `cmd` under its canonical long
+/// name or any visible or hidden alias.
+fn long_arg_exists(cmd: &clap::Command, flag: &str) -> bool {
+    cmd.get_arguments().any(|a| {
+        a.get_long() == Some(flag)
+            || a.get_all_aliases()
+                .is_some_and(|aliases| aliases.into_iter().any(|alias| alias == flag))
+    })
+}
+
+/// Whether a *closed* word consumed as a positional at `pos_index` cannot be
+/// part of a valid command line.
+///
+/// A committed plain word that did not enter a subcommand has to fill a
+/// positional at the current layer:
+/// - with external subcommands enabled, any leftover word names one, so every
+///   word is legal;
+/// - with no positional left to fill, clap rejects the word (an unexpected or
+///   unrecognized subcommand), so the whole line is uncompletable;
+/// - a positional with a fixed possible-value set only accepts words one of
+///   its values accepts, just like a rejected option value;
+/// - a free-form positional (paths, a custom completer, ...) accepts anything.
+///
+/// The word under the cursor is never checked here; it is still being typed and
+/// is merely filtered by the candidate sources.
+fn positional_value_is_illegal(cmd: &clap::Command, pos_index: usize, value: &OsStr) -> bool {
+    if cmd.is_allow_external_subcommands_set() {
+        return false;
+    }
+    let Some(positional) = cmd
+        .get_positionals()
+        .find(|p| p.get_index() == Some(pos_index))
+    else {
+        return true;
+    };
+    let Some(possible) = possible_values(positional) else {
+        return false;
+    };
+    let Some(value) = value.to_str() else {
+        // A non-UTF-8 word cannot match a stringly possible value.
+        return true;
+    };
+    let ignore_case = positional.is_ignore_case_set();
+    !possible
+        .collect::<Vec<_>>()
+        .iter()
+        .any(|pv| pv.matches(value, ignore_case))
 }
 
 /// Gets subcommands of [`clap::Command`] in the form of `("name", "bin_name")`.

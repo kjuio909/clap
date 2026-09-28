@@ -3338,6 +3338,300 @@ fn complete_no_binary_name_equals_records_state() {
     assert_eq!(completions, vec!["--tag", "--help"]);
 }
 
+/// A root command that declares both a positional (`target`: `local`/`remote`)
+/// and inferable subcommands sharing a prefix (`run`/`remote`/`reset`, with
+/// visible aliases), used to assert the dynamic completer picks the parsing
+/// layer deterministically.
+fn layer_command() -> Command {
+    Command::new("tool")
+        .arg(clap::Arg::new("target").value_parser(["local", "remote"]))
+        .subcommand(
+            Command::new("run")
+                .visible_alias("r")
+                .arg(clap::Arg::new("profile").long("profile"))
+                .arg(clap::Arg::new("run_arg").value_parser(["alpha", "beta"])),
+        )
+        .subcommand(
+            Command::new("remote")
+                .visible_alias("rem")
+                .arg(clap::Arg::new("url").long("url"))
+                .arg(clap::Arg::new("remote_arg").value_parser(["r-a", "r-b"])),
+        )
+        .subcommand(Command::new("reset"))
+        // Hidden members must never show up in a normal candidate list or leak
+        // into a selected subcommand's layer.
+        .subcommand(Command::new("hidden").hide(true))
+        .arg(
+            clap::Arg::new("quiet")
+                .long("quiet")
+                .hide(true)
+                .action(clap::ArgAction::SetTrue),
+        )
+}
+
+#[test]
+fn suggest_layer_hidden_members_stay_hidden_and_local() {
+    // Neither the hidden subcommand nor the hidden root option appear at the
+    // root's empty word.
+    let root = complete!(layer_command(), " [TAB]");
+    assert!(!root.contains("hidden"));
+    assert!(!root.contains("--quiet"));
+
+    // Hidden root names do not leak into a selected subcommand's layer.
+    let in_run = complete!(layer_command(), "run [TAB]");
+    assert!(!in_run.contains("hidden"));
+    assert!(!in_run.contains("--quiet"));
+    assert!(!in_run.contains("--url"));
+
+    // The exact hidden name still selects its layer like any real subcommand,
+    // mirroring clap's parser, it simply is not advertised.
+    assert_data_eq!(
+        complete!(layer_command(), "hidden [TAB]"),
+        snapbox::str!["--help\tPrint help"]
+    );
+}
+
+#[test]
+fn suggest_layer_empty_word_lists_subcommands_and_positionals() {
+    // The empty word right after the root name lists the public subcommands and
+    // the positional values together, with root options; hidden names never do.
+    assert_data_eq!(
+        complete!(layer_command(), " [TAB]"),
+        snapbox::str![[r#"
+r
+rem
+reset
+help	Print this message or the help of the given subcommand(s)
+local
+remote
+--help	Print help
+"#]],
+    );
+}
+
+#[test]
+fn suggest_layer_cursor_word_filters_without_selecting() {
+    // The word under the cursor is still being typed: it filters the root
+    // layer's subcommands and positionals, never descending into a subcommand
+    // or producing an error.
+    assert_data_eq!(
+        complete!(layer_command(), "re[TAB]"),
+        snapbox::str![[r#"
+rem
+reset
+remote
+"#]]
+    );
+    assert_data_eq!(complete!(layer_command(), "res[TAB]"), snapbox::str!["reset"]);
+    assert_data_eq!(
+        complete!(layer_command(), "remote[TAB]"),
+        snapbox::str!["remote"]
+    );
+    assert_data_eq!(complete!(layer_command(), "l[TAB]"), snapbox::str!["local"]);
+    // An overlong or unknown prefix at the cursor simply matches nothing.
+    assert_data_eq!(complete!(layer_command(), "runx[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(layer_command(), "xyz[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(layer_command(), "toolruX[TAB]"), snapbox::str![""]);
+}
+
+#[test]
+fn suggest_layer_unique_prefix_or_alias_enters_subcommand() {
+    // A committed full word, unique prefix or alias enters the selected layer,
+    // and the next empty word comes only from that layer; alias and canonical
+    // spellings establish the same state.
+    assert_data_eq!(
+        complete!(layer_command(), "run [TAB]"),
+        snapbox::str![[r#"
+alpha
+beta
+--profile
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(layer_command(), "r [TAB]"),
+        snapbox::str![[r#"
+alpha
+beta
+--profile
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(layer_command(), "ru [TAB]"),
+        snapbox::str![[r#"
+alpha
+beta
+--profile
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(layer_command(), "remote [TAB]"),
+        snapbox::str![[r#"
+r-a
+r-b
+--url
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(layer_command(), "rem [TAB]"),
+        snapbox::str![[r#"
+r-a
+r-b
+--url
+--help	Print help
+"#]],
+    );
+    assert_data_eq!(
+        complete!(layer_command(), "reset [TAB]"),
+        snapbox::str!["--help\tPrint help"]
+    );
+
+    // Inside the selected layer only its own options are completed.
+    assert_data_eq!(
+        complete!(layer_command(), "r --pr[TAB]"),
+        snapbox::str!["--profile"]
+    );
+    assert_data_eq!(
+        complete!(layer_command(), "rem --u[TAB]"),
+        snapbox::str!["--url"]
+    );
+}
+
+#[test]
+fn suggest_layer_exact_subcommand_beats_positional() {
+    // `remote` is both a positional value and a subcommand name; the exact
+    // subcommand wins and the next word completes inside the subcommand.
+    assert_data_eq!(
+        complete!(layer_command(), "remote [TAB]"),
+        snapbox::str![[r#"
+r-a
+r-b
+--url
+--help	Print help
+"#]],
+    );
+    // `local` is only a positional value, so the root layer stays selected.
+    assert_data_eq!(
+        complete!(layer_command(), "local [TAB]"),
+        snapbox::str![[r#"
+r
+rem
+reset
+help	Print this message or the help of the given subcommand(s)
+--help	Print help
+"#]],
+    );
+    // Editing that positional value filters the root layer as usual.
+    assert_data_eq!(
+        complete!(layer_command(), "local r[TAB]"),
+        snapbox::str![[r#"
+r
+rem
+reset
+"#]]
+    );
+}
+
+#[test]
+fn suggest_layer_ambiguous_closed_prefix_is_error() {
+    // `re` is a prefix of both `remote` and `reset`. As a committed word the
+    // completer must not pick a branch or fall back to parent candidates.
+    assert_eq!(complete_err(&mut layer_command(), "re [TAB]"), "no completion generated");
+    // A word committed after the ambiguous prefix cannot rescue the line.
+    assert_eq!(
+        complete_err(&mut layer_command(), "re --url [TAB]"),
+        "no completion generated"
+    );
+    // After the positional is filled, a non-exact subcommand token still
+    // cannot silently enter a layer or stay on the parent.
+    assert_eq!(
+        complete_err(&mut layer_command(), "local re [TAB]"),
+        "no completion generated"
+    );
+}
+
+#[test]
+fn suggest_layer_escape_only_positionals_and_dirs() {
+    // After a standalone `--` only the current layer's positional values (and
+    // directory entries) are offered; no options, aliases or other layer names.
+    assert_data_eq!(
+        complete!(layer_command(), "-- [TAB]"),
+        snapbox::str![[r#"
+local
+remote
+"#]]
+    );
+    assert_data_eq!(
+        complete!(layer_command(), "run -- [TAB]"),
+        snapbox::str![[r#"
+alpha
+beta
+"#]]
+    );
+    assert_data_eq!(
+        complete!(layer_command(), "remote -- [TAB]"),
+        snapbox::str![[r#"
+r-a
+r-b
+"#]]
+    );
+    // An escaped subcommand-looking word stays a positional, even when it is an
+    // exact subcommand name, so options never come back.
+    assert_data_eq!(complete!(layer_command(), "-- local [TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(layer_command(), "run -- --pr[TAB]"), snapbox::str![""]);
+}
+
+#[test]
+fn suggest_layer_invalid_committed_words_error() {
+    // Unknown options, glued words, overlong prefixes and values with no
+    // accepting positional all produce the same error rather than an empty
+    // success, a guessed split or a rewritten word order.
+    for input in [
+        "--bogus [TAB]",
+        "xyz [TAB]",
+        "remoteX [TAB]",
+        "toolruX [TAB]",
+        "runx [TAB]",
+        "reset x [TAB]",
+        "r --bogus [TAB]",
+        "local --bogus [TAB]",
+        "-- xyz [TAB]",
+        "-- re [TAB]",
+    ] {
+        assert_eq!(complete_err(&mut layer_command(), input), "no completion generated");
+    }
+}
+
+#[test]
+fn suggest_layer_calls_are_stateless_and_equivalent() {
+    // Canonical name, alias, full word and verbatim edits return equivalent
+    // results on independent commands, and repeating a call leaves no inferred
+    // state behind.
+    let run_like = |word: &'static str| {
+        let mut cmd = layer_command();
+        let args = vec![
+            std::ffi::OsString::from("tool"),
+            std::ffi::OsString::from(word),
+            std::ffi::OsString::default(),
+        ];
+        clap_complete::engine::complete(&mut cmd, args, 2, None)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.get_value().to_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(run_like("run"), run_like("r"));
+    assert_eq!(run_like("remote"), run_like("rem"));
+
+    // Repeated identical calls on the same command definition are stable.
+    let first = run_like("ru");
+    let second = run_like("ru");
+    assert_eq!(first, second);
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];

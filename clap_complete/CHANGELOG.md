@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixes
 
+- *(dynamic)* Select the current parsing layer deterministically when a command declares both positional values and inferable subcommands: a committed full name, visible alias or unique prefix enters that subcommand (an exact name always wins over a same-named positional), an ambiguous prefix produces no completion, and later words complete only within the selected layer; after `--` only the current layer's positionals and directory entries are offered
+- *(dynamic)* Reject committed words that cannot belong to a valid command line (unknown options, glued or overlong subcommand prefixes, and fixed-set positional values that match nothing) with "no completion generated" instead of leaking parent-layer candidates, while the word still being typed keeps filtering as usual
 - *(dynamic)* Deduplicate completion candidates that propose the same insertion text from different sources
 - *(dynamic)* Complete the current `value_delimiter` segment of a multi-value argument independently of the segments already typed, respecting its value limit, suppressing already selected values and rejecting overfull or malformed values
 
