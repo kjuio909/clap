@@ -99,11 +99,18 @@ pub fn complete(
         }
 
         if let Ok(value) = arg.to_value() {
-            // A dangling delimiter forces this word to be the option's next
-            // segment, never a subcommand.
-            let open_segment = matches!(&current_state, ParseState::Opt(state) if state.open);
-            if !open_segment {
-                if let Some(next_cmd) = current_cmd.find_subcommand(value) {
+            // clap's parser probes for a subcommand only outside an ongoing
+            // option value or multi-value positional, and never after `--`.
+            // A word is therefore left to its level when a multi-value
+            // positional is being filled or an option is still taking values
+            // (including a dangling delimiter segment). The one-word `closed`
+            // window of an option with a value terminator already finished the
+            // occurrence, so it probes like an ordinary level.
+            let filling_positional = matches!(current_state, ParseState::Pos(..));
+            let taking_option_value =
+                matches!(&current_state, ParseState::Opt(state) if !state.closed);
+            if !is_escaped && !filling_positional && !taking_option_value {
+                if let Some(next_cmd) = select_subcommand(current_cmd, value) {
                     current_cmd = next_cmd;
                     pos_index = 1;
                     last_terminator = None;
@@ -164,8 +171,15 @@ pub fn complete(
         };
 
         if is_escaped {
+            let accepted = closed_positional_is_accepted(current_cmd, pos_index, arg.to_value_os());
             (next_state, pos_index) =
                 parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
+            if !accepted {
+                // After `--`, clap accepts only positional values (and
+                // directory entries for path arguments); a word the slot
+                // rejects makes the whole line uncompletable.
+                is_illegal = true;
+            }
         } else if arg.is_escape() {
             is_escaped = true;
         } else if consumed_terminator.is_some() {
@@ -204,9 +218,21 @@ pub fn complete(
                         }
                     }
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
+                    let accepted =
+                        closed_positional_is_accepted(current_cmd, pos_index, arg.to_value_os());
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
+                    if !accepted {
+                        is_illegal = true;
+                    }
+                } else {
+                    // A closed word with a `--name`/`--name=value` shape that
+                    // names no option cannot be part of a valid command line;
+                    // clap reports an unknown argument.
+                    is_illegal = true;
                 }
+            } else if !pos_allows_hyphen(current_cmd, pos_index) {
+                is_illegal = true;
             }
         } else if let Some(short) = arg.to_short() {
             let (leading_flags, takes_value_opt, mut short, cluster_valid) =
@@ -237,14 +263,33 @@ pub fn complete(
                     next_state = ParseState::Opt(OptState::new(opt, 1));
                 }
             } else if pos_allows_hyphen(current_cmd, pos_index) {
+                let accepted =
+                    closed_positional_is_accepted(current_cmd, pos_index, arg.to_value_os());
                 (next_state, pos_index) =
                     parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
+                if !accepted {
+                    is_illegal = true;
+                }
             }
+            // An invalid short cluster (an unknown member, or no
+            // value-taking option) deliberately keeps the legacy completion
+            // behavior rather than flagging the line: its members are not
+            // guessed apart, and the cursor word still completes on this
+            // level.
         } else {
             match dispatch_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
+                    let accepted =
+                        closed_positional_is_accepted(current_cmd, pos_index, arg.to_value_os());
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
+                    if !accepted {
+                        // The word names no subcommand and the current
+                        // positional slot does not accept it, so clap would
+                        // reject the line. Completion must not guess a split or
+                        // keep offering parent-level candidates.
+                        is_illegal = true;
+                    }
                 }
                 ParseState::Opt(state) => {
                     next_state = advance_opt_value(state, arg.to_value_os(), &mut is_illegal);
@@ -1158,6 +1203,73 @@ fn complete_value_candidates_str(
     complete_candidates_str(value, completer.candidates())
 }
 
+/// Resolve a closed word to the subcommand it selects on this level.
+///
+/// This mirrors clap's parser: an exact name or alias always wins (so a
+/// positional value that merely shares a prefix, e.g. `remote`, cannot shadow a
+/// subcommand of the same name); otherwise, when subcommand inference is
+/// enabled, a unique name-or-alias prefix selects that subcommand. A prefix
+/// shared by several subcommands resolves to nothing here, just as clap
+/// rejects such a word rather than choosing a branch; the caller then treats
+/// it as an ordinary positional value.
+fn select_subcommand<'c>(cmd: &'c clap::Command, value: &str) -> Option<&'c clap::Command> {
+    if let Some(subcommand) = cmd.find_subcommand(value) {
+        return Some(subcommand);
+    }
+    if cmd.is_infer_subcommands_set() {
+        let mut matches = cmd.get_subcommands().filter(|subcommand| {
+            subcommand.get_name().starts_with(value)
+                || subcommand
+                    .get_all_aliases()
+                    .any(|alias| alias.starts_with(value))
+        });
+        let first = matches.next()?;
+        if matches.next().is_none() {
+            return Some(first);
+        }
+    }
+    None
+}
+
+/// Whether a closed (already submitted) word can occupy the positional slot at
+/// `pos_index`, mirroring clap's parser.
+///
+/// A positional without a fixed value set (a free-form parser, a path hint or
+/// a custom completer) accepts every word. A positional backed by possible
+/// values accepts only one of them (by name or alias, honoring
+/// `ignore_case`), splitting a bounded delimiter word into its segments just
+/// like an option value. With no positional slot left, an external subcommand
+/// command swallows the word; otherwise clap rejects the line.
+fn closed_positional_is_accepted(cmd: &clap::Command, pos_index: usize, word: &OsStr) -> bool {
+    let Some(positional) = cmd
+        .get_positionals()
+        .find(|p| p.get_index() == Some(pos_index))
+    else {
+        // No slot remains: an external subcommand accepts any trailing word,
+        // anything else is an unrecognized subcommand/argument.
+        return cmd.is_allow_external_subcommands_set();
+    };
+
+    let Some(possible) = possible_values(positional) else {
+        return true;
+    };
+    let ignore_case = positional.is_ignore_case_set();
+    let possible: Vec<_> = possible.collect();
+
+    let segments: Vec<&OsStr> = match is_bounded_delimited(positional) {
+        Some(delim) => {
+            let (segments, _dangling) = split_delimited(word, delim);
+            segments
+        }
+        None => vec![word],
+    };
+    segments.iter().all(|segment| {
+        segment
+            .to_str()
+            .is_some_and(|s| possible.iter().any(|pv| pv.matches(s, ignore_case)))
+    })
+}
+
 fn complete_subcommand(value: &str, cmd: &clap::Command) -> Vec<CompletionCandidate> {
     debug!(
         "complete_subcommand: cmd={:?}, value={:?}",
@@ -1178,6 +1290,20 @@ fn complete_subcommand(value: &str, cmd: &clap::Command) -> Vec<CompletionCandid
             ));
         }
     }
+
+    // `subcommands` lists the canonical name before each of its aliases; drop
+    // aliases of a subcommand whose canonical name is still offered. This must
+    // happen before the alphabetical sort, or a short alias (`r` for `run`,
+    // `rem` for `remote`) would sort ahead of the canonical name and survive
+    // the later by-id de-duplication instead of it.
+    let mut seen_ids = HashSet::new();
+    scs.retain(|candidate| {
+        candidate
+            .get_id()
+            .cloned()
+            .map(|id| seen_ids.insert(id))
+            .unwrap_or(true)
+    });
 
     scs.sort();
     scs.dedup();

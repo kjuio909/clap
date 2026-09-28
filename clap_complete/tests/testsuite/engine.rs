@@ -3373,3 +3373,295 @@ fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>
         .collect::<Vec<_>>()
         .join("\n")
 }
+
+/// Root `tool` command whose positional `target` accepts `local`/`remote`
+/// while it also exposes subcommands. Subcommand inference is on, so unique
+/// prefixes select a subcommand; an exact subcommand name beats the positional.
+fn layer_command() -> Command {
+    Command::new("tool")
+        .infer_subcommands(true)
+        .arg(clap::Arg::new("target").value_parser(["local", "remote"]))
+        .arg(clap::Arg::new("secret").long("secret").hide(true))
+        .subcommand(
+            Command::new("run")
+                .visible_alias("r")
+                .arg(clap::Arg::new("profile").long("profile"))
+                .arg(clap::Arg::new("dir").value_hint(clap::ValueHint::DirPath)),
+        )
+        .subcommand(
+            Command::new("remote")
+                .visible_alias("rem")
+                .arg(clap::Arg::new("url").long("url")),
+        )
+        .subcommand(Command::new("reset"))
+        .subcommand(Command::new("hidden-cmd").hide(true))
+}
+
+fn layer_tempdir() -> snapbox::dir::DirRoot {
+    let testdir = snapbox::dir::DirRoot::mutable_temp().unwrap();
+    let path = testdir.path().unwrap();
+    fs::create_dir_all(path.join("a_dir/nested")).unwrap();
+    fs::create_dir_all(path.join("b_dir")).unwrap();
+    fs::write(path.join("a_file"), "").unwrap();
+    testdir
+}
+
+#[test]
+fn layer_empty_word_lists_public_subcommands_and_positional() {
+    let testdir = layer_tempdir();
+    let path = testdir.path().unwrap();
+
+    // The empty word at root offers every *visible* subcommand (canonical
+    // names only; the `r`/`rem` aliases collapse into their command) and both
+    // positional values, where `remote` merges with the subcommand of the same
+    // name. Hidden subcommands and root options never appear.
+    assert_data_eq!(
+        complete!(layer_command(), " [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+run
+remote
+reset
+help	Print this message or the help of the given subcommand(s)
+local
+--help	Print help
+"#]]
+    );
+}
+
+#[test]
+fn layer_cursor_prefixes_are_listed_not_selected() {
+    // The word still being edited only filters candidates: a shared prefix
+    // lists every match for disambiguation instead of choosing a branch.
+    assert_data_eq!(
+        complete!(layer_command(), "r[TAB]"),
+        snapbox::str![[r#"
+run
+remote
+reset
+"#]]
+    );
+    assert_data_eq!(
+        complete!(layer_command(), "re[TAB]"),
+        snapbox::str![[r#"
+remote
+reset
+"#]]
+    );
+    assert_data_eq!(complete!(layer_command(), "ru[TAB]"), snapbox::str!["run"]);
+    assert_data_eq!(complete!(layer_command(), "rem[TAB]"), snapbox::str!["remote"]);
+    assert_data_eq!(complete!(layer_command(), "l[TAB]"), snapbox::str!["local"]);
+}
+
+#[test]
+fn layer_unique_prefix_and_alias_select_the_subcommand() {
+    let testdir = layer_tempdir();
+    let path = testdir.path().unwrap();
+
+    // Canonical name, unique prefix and visible alias all establish the same
+    // run-level state: the next empty word comes only from run's positional
+    // directory and its options, never from root-level candidates.
+    for input in ["run [TAB]", "ru [TAB]", "r [TAB]"] {
+        assert_data_eq!(
+            complete!(layer_command(), input, current_dir = Some(path)),
+            snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+--profile
+--help	Print help
+"#]]
+        );
+    }
+
+    // `remote` and the `rem` alias select the remote level (`--url` only).
+    for input in ["remote [TAB]", "rem [TAB]"] {
+        assert_data_eq!(
+            complete!(layer_command(), input),
+            snapbox::str![[r#"
+--url
+--help	Print help
+"#]]
+        );
+    }
+    assert_data_eq!(complete!(layer_command(), "remote --u[TAB]"), snapbox::str!["--url"]);
+    assert_data_eq!(complete!(layer_command(), "rem --u[TAB]"), snapbox::str!["--url"]);
+
+    // `reset` exposes only its own help option.
+    assert_data_eq!(
+        complete!(layer_command(), "reset [TAB]"),
+        snapbox::str![[r#"
+--help	Print help
+"#]]
+    );
+}
+
+#[test]
+fn layer_exact_subcommand_beats_positional_and_local_stays_root() {
+    // `remote` matches a subcommand exactly, so it enters the remote level
+    // rather than filling the `target` positional.
+    assert_data_eq!(
+        complete!(layer_command(), "remote [TAB]"),
+        snapbox::str![[r#"
+--url
+--help	Print help
+"#]]
+    );
+
+    // `local` is only a positional value; parsing stays on the root level, so
+    // the following empty word still offers the root subcommands and options
+    // (the single-value positional is now consumed).
+    assert_data_eq!(
+        complete!(layer_command(), "local [TAB]"),
+        snapbox::str![[r#"
+run
+remote
+reset
+help	Print this message or the help of the given subcommand(s)
+--help	Print help
+"#]]
+    );
+
+    // A subcommand may still follow the positional value.
+    let testdir = layer_tempdir();
+    let path = testdir.path().unwrap();
+    assert_data_eq!(
+        complete!(layer_command(), "local ru [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+--profile
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(layer_command(), "local remote [TAB]"),
+        snapbox::str![[r#"
+--url
+--help	Print help
+"#]]
+    );
+}
+
+#[test]
+fn layer_ambiguous_closed_prefix_is_an_error() {
+    // `re` uniquely selects nothing (both `remote` and `reset` start with it);
+    // once the word is closed the line cannot branch, so completion errors
+    // instead of picking one or mixing in parent candidates.
+    assert_eq!(
+        complete_err(&mut layer_command(), "re [TAB]"),
+        "no completion generated"
+    );
+    assert_eq!(
+        complete_err(&mut layer_command(), "local re [TAB]"),
+        "no completion generated"
+    );
+
+    // While still being edited, the same letters merely list the matches.
+    assert_data_eq!(
+        complete!(layer_command(), "re[TAB]"),
+        snapbox::str![[r#"
+remote
+reset
+"#]]
+    );
+}
+
+#[test]
+fn layer_after_escape_only_current_positionals_and_directories() {
+    let testdir = layer_tempdir();
+    let path = testdir.path().unwrap();
+
+    // Root `--`: only the fixed positional values.
+    assert_data_eq!(
+        complete!(layer_command(), "-- [TAB]"),
+        snapbox::str![[r#"
+local
+remote
+"#]]
+    );
+    // A prefix still filters the positional values.
+    assert_data_eq!(complete!(layer_command(), "-- re[TAB]"), snapbox::str!["remote"]);
+
+    // Run `--`: only the directory positional, read from current_dir; no
+    // options, aliases or other-level names leak back in.
+    assert_data_eq!(
+        complete!(layer_command(), "run -- [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+"#]]
+    );
+    assert_data_eq!(
+        complete!(layer_command(), "r -- a[TAB]", current_dir = Some(path)),
+        snapbox::str!["a_dir/"]
+    );
+
+    // Levels without a positional offer nothing after `--`.
+    assert_data_eq!(complete!(layer_command(), "remote -- [TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(layer_command(), "local -- [TAB]"), snapbox::str![""]);
+}
+
+#[test]
+fn layer_illegal_closed_words_error_but_edited_words_stay_empty() {
+    // Unknown options, glued junk, over-long/non-matching prefixes and words
+    // with no accepting slot make a closed line uncompletable: the engine
+    // errors rather than succeeding empty, guessing a split or reordering.
+    for input in [
+        "--bogus [TAB]",
+        "toolruX [TAB]",
+        "runn [TAB]",
+        "xyz [TAB]",
+        "reset x [TAB]",
+        "local local [TAB]",
+    ] {
+        assert_eq!(
+            complete_err(&mut layer_command(), input),
+            "no completion generated",
+            "expected error for {input}"
+        );
+    }
+
+    // The same text in the word under the cursor is only a filter with no
+    // match: an empty success, never an error.
+    assert_data_eq!(complete!(layer_command(), "--bogus[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(layer_command(), "toolruX[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(layer_command(), "runn[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(layer_command(), "xyz[TAB]"), snapbox::str![""]);
+}
+
+#[test]
+fn layer_repeated_calls_are_stable_and_stateless() {
+    let mut cmd = layer_command();
+
+    // Canonical name, alias and unique prefix give equivalent results across
+    // repeated calls on the same command, with no inferred state carried over
+    // and the command definition left unchanged.
+    let canonical = complete!(&mut cmd, "run --pr[TAB]");
+    let alias = complete!(&mut cmd, "r --pr[TAB]");
+    let prefix = complete!(&mut cmd, "ru --pr[TAB]");
+    assert_data_eq!(canonical.clone(), snapbox::str!["--profile"]);
+    assert_eq!(canonical, alias);
+    assert_eq!(alias, prefix);
+
+    for input in ["run [TAB]", "r [TAB]", "ru [TAB]", "run [TAB]"] {
+        assert_data_eq!(
+            complete!(&mut cmd, input),
+            snapbox::str![[r#"
+--profile
+--help	Print help
+"#]]
+        );
+    }
+
+    // The root definition is intact and selects its layer afresh afterwards.
+    assert_data_eq!(
+        complete!(&mut cmd, "re[TAB]"),
+        snapbox::str![[r#"
+remote
+reset
+"#]]
+    );
+}
+

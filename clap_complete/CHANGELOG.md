@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Fixes
 
+- *(dynamic)* Keep completion on the current parsing level when a command declares both a positional and inferable subcommands: an exact subcommand name (or a visible alias) always selects the subcommand, a unique prefix selects it only when `infer_subcommands` is enabled, and an ambiguous prefix or a word the current level cannot accept produces "no completion generated" instead of leaking parent candidates or treating a subcommand as a positional value
+- *(dynamic)* List a subcommand's canonical name instead of an alias that sorts ahead of it when both match the word being edited
 - *(dynamic)* Deduplicate completion candidates that propose the same insertion text from different sources
 - *(dynamic)* Complete the current `value_delimiter` segment of a multi-value argument independently of the segments already typed, respecting its value limit, suppressing already selected values and rejecting overfull or malformed values
 

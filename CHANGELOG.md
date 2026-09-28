@@ -27,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ### Features
 
 - Add `Arg::get_conflicts_with`, `ArgGroup::get_conflicts_with`, and `ArgGroup::is_multiple_set` for reflecting on argument conflict relationships
+- Make `Command::is_infer_subcommands_set` public for reflecting on whether subcommand prefix inference is enabled
 
 ## [4.6.7] - 2026-09-14
 

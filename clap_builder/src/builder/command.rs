@@ -4188,7 +4188,7 @@ impl Command {
     }
 
     /// Report whether [`Command::infer_subcommands`] is set
-    pub(crate) fn is_infer_subcommands_set(&self) -> bool {
+    pub fn is_infer_subcommands_set(&self) -> bool {
         self.is_set(AppSettings::InferSubcommands)
     }
 
