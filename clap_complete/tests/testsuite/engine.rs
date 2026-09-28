@@ -1829,6 +1829,312 @@ fn suggest_hidden_items_unknown_paths_empty() {
     assert!(complete_argv(&mut cmd, &["tool", "i", "deb", "--", ""]).is_empty());
 }
 
+/// Root command used by the interleaved optional/required value tests:
+/// - `--color` is a repeatable option whose value is *optional*
+///   (`auto`/`always`/`never`),
+/// - `--format` takes one required value (`json`/`yaml`) and cannot repeat,
+/// - the repeatable `files` positional always offers `a.txt`/`b.txt`.
+fn interleaved_command() -> Command {
+    Command::new("tool")
+        .arg(
+            clap::Arg::new("color")
+                .long("color")
+                .action(clap::ArgAction::Append)
+                .num_args(0..=1)
+                .value_parser(["auto", "always", "never"]),
+        )
+        .arg(
+            clap::Arg::new("format")
+                .long("format")
+                .value_parser(["json", "yaml"]),
+        )
+        .arg(
+            clap::Arg::new("files")
+                .action(clap::ArgAction::Append)
+                .num_args(1..)
+                .value_parser(["a.txt", "b.txt"]),
+        )
+}
+
+/// Strip an attached `--flag=` / `-f=` prefix so the space-attached and
+/// equals-attached forms can be compared by their underlying values.
+fn strip_attached_prefix(prefix: &str, values: Vec<String>) -> Vec<String> {
+    values
+        .into_iter()
+        .map(|value| match value.strip_prefix(prefix) {
+            Some(stripped) => stripped.to_owned(),
+            None => value,
+        })
+        .collect()
+}
+
+#[test]
+fn interleaved_empty_value_positions() {
+    // The optional `--color` offers every declared value at its empty value
+    // position, with no positional or flag candidates leaking in.
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--color", ""]),
+        vec!["auto", "always", "never"]
+    );
+    // The equals form carries the `--color=` replacement prefix but lists the
+    // same values in the same order.
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--color="]),
+        vec![
+            "--color=auto",
+            "--color=always",
+            "--color=never"
+        ]
+    );
+
+    // The required-value `--format` offers exactly its two values.
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--format", ""]),
+        vec!["json", "yaml"]
+    );
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--format="]),
+        vec!["--format=json", "--format=yaml"]
+    );
+}
+
+#[test]
+fn interleaved_prefix_filtering() {
+    // A partial value only narrows the current option; it never changes other
+    // tokens' interpretation.
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--color", "au"]),
+        vec!["auto"]
+    );
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--color=au"]),
+        vec!["--color=auto"]
+    );
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--format", "ya"]),
+        vec!["yaml"]
+    );
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--format=ya"]),
+        vec!["--format=yaml"]
+    );
+
+    // Space and equals forms agree on the underlying values at the same cursor.
+    let spaced = complete_argv(&mut interleaved_command(), &["tool", "--color", "au"]);
+    let attached = strip_attached_prefix(
+        "--color=",
+        complete_argv(&mut interleaved_command(), &["tool", "--color=au"]),
+    );
+    assert_eq!(spaced, attached);
+
+    // Non-matching prefixes yield nothing rather than other options' values.
+    assert!(complete_argv(&mut interleaved_command(), &["tool", "--color", "z"]).is_empty());
+    assert!(complete_argv(&mut interleaved_command(), &["tool", "--format=x"]).is_empty());
+}
+
+#[test]
+fn interleaved_optional_value_omitted_before_required() {
+    // `--color` followed by another flag omits the optional value; the cursor
+    // serves `--format` only, so no color values are mixed in.
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--color", "--format", ""]),
+        vec!["json", "yaml"]
+    );
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_command(),
+            &["tool", "--color", "--format", "js"]
+        ),
+        vec!["json"]
+    );
+
+    // An attached empty color value is invalid, so the incomplete `js` value of
+    // `--format` cannot surface format candidates and color values never leak.
+    assert!(
+        complete_argv(&mut interleaved_command(), &["tool", "--color=", "--format", "js"])
+            .is_empty()
+    );
+
+    // A committed, non-cursor `au` token is an invalid color value; completion
+    // stops instead of serving `--format`.
+    assert!(
+        complete_argv(&mut interleaved_command(), &["tool", "--color", "au", "--format", ""])
+            .is_empty()
+    );
+
+    // The required-value option cannot omit its value for `--color`.
+    assert!(
+        complete_argv(&mut interleaved_command(), &["tool", "--format", "--color", ""]).is_empty()
+    );
+    assert!(
+        complete_argv(&mut interleaved_command(), &["tool", "--format", "--color"]).is_empty()
+    );
+}
+
+#[test]
+fn interleaved_repeated_optional_keeps_full_set() {
+    let colors = vec!["auto", "always", "never"];
+    let attached_colors = vec![
+        "--color=auto",
+        "--color=always",
+        "--color=never",
+    ];
+
+    // Each independent occurrence offers the full set in declaration order,
+    // regardless of previously completed prefixes.
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_command(),
+            &["tool", "--color", "always", "--color", ""]
+        ),
+        colors
+    );
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_command(),
+            &["tool", "--color=always", "--color="]
+        ),
+        attached_colors
+    );
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_command(),
+            &["tool", "--color", "always", "--color", "always", "--color", ""]
+        ),
+        colors
+    );
+
+    // Partial values within later occurrences stay focused on that occurrence.
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_command(),
+            &["tool", "--color", "always", "--color", "nev"]
+        ),
+        vec!["never"]
+    );
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_command(),
+            &["tool", "--color=always", "--color=au"]
+        ),
+        vec!["--color=auto"]
+    );
+
+    // The two spellings produce the same underlying text sequence after every
+    // completed occurrence.
+    let spaced = complete_argv(
+        &mut interleaved_command(),
+        &["tool", "--color", "always", "--color", ""],
+    );
+    let attached = strip_attached_prefix(
+        "--color=",
+        complete_argv(
+            &mut interleaved_command(),
+            &["tool", "--color=always", "--color="],
+        ),
+    );
+    assert_eq!(spaced, attached);
+    assert_eq!(spaced, colors);
+}
+
+#[test]
+fn interleaved_repeated_required_is_empty() {
+    // `--format` cannot be repeated, so actively supplying another value gives
+    // no candidates in either spelling.
+    assert!(
+        complete_argv(&mut interleaved_command(), &["tool", "--format", "json", "--format", ""])
+            .is_empty()
+    );
+    assert!(
+        complete_argv(&mut interleaved_command(), &["tool", "--format", "json", "--format=j"])
+            .is_empty()
+    );
+
+    // But the flag name itself is still listed in the option menu, and an
+    // already satisfied value leaves normal completion available.
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--format", "json", ""]),
+        vec!["a.txt", "b.txt", "--color", "--format", "--help"]
+    );
+    assert_eq!(
+        complete_argv(
+            &mut interleaved_command(),
+            &["tool", "--format", "json", "--format"]
+        ),
+        vec!["--format"]
+    );
+}
+
+#[test]
+fn interleaved_after_escape_only_positionals() {
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--", ""]),
+        vec!["a.txt", "b.txt"]
+    );
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--", "a"]),
+        vec!["a.txt"]
+    );
+
+    // Tokens that look like options are treated purely as positional values.
+    assert!(complete_argv(&mut interleaved_command(), &["tool", "--", "--color"]).is_empty());
+    assert!(complete_argv(&mut interleaved_command(), &["tool", "--", "--format"]).is_empty());
+
+    // The positional keeps offering its fixed candidates after a value.
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "--", "a.txt", ""]),
+        vec!["a.txt", "b.txt"]
+    );
+    assert_eq!(
+        complete_argv(&mut interleaved_command(), &["tool", "a.txt", ""]),
+        vec!["a.txt", "b.txt", "--color", "--format", "--help"]
+    );
+}
+
+#[test]
+fn interleaved_unknown_and_invalid_stay_empty() {
+    // Unknown options never fall back to root-command candidates.
+    assert!(complete_argv(&mut interleaved_command(), &["tool", "--unknown", ""]).is_empty());
+    assert!(complete_argv(&mut interleaved_command(), &["tool", "--unknown=x"]).is_empty());
+
+    // Invalid committed values invalidate the whole line.
+    assert!(complete_argv(&mut interleaved_command(), &["tool", "--color=xx"]).is_empty());
+    assert!(complete_argv(&mut interleaved_command(), &["tool", "--color", "xx"]).is_empty());
+    assert!(
+        complete_argv(&mut interleaved_command(), &["tool", "--color=xx", "--format", ""])
+            .is_empty()
+    );
+    assert!(
+        complete_argv(&mut interleaved_command(), &["tool", "--format", "xml", ""]).is_empty()
+    );
+}
+
+#[test]
+fn interleaved_state_is_rebuilt_per_call() {
+    let mut cmd = interleaved_command();
+
+    let run = |cmd: &mut Command, argv: &[&str]| -> Vec<String> {
+        let arg_index = argv.len() - 1;
+        let args = argv.iter().map(std::ffi::OsString::from).collect();
+        clap_complete::engine::complete(cmd, args, arg_index, None)
+            .unwrap()
+            .into_iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect()
+    };
+
+    let colors = vec!["auto", "always", "never"];
+
+    // A successful call on the reused command does not influence the next one.
+    assert_eq!(run(&mut cmd, &["tool", "--format", "json", "--color", ""]), colors);
+    assert_eq!(run(&mut cmd, &["tool", "--color", ""]), colors);
+
+    // Neither does a failed call leak its partial match or error state.
+    assert!(run(&mut cmd, &["tool", "--color=zz", "--format", ""]).is_empty());
+    assert_eq!(run(&mut cmd, &["tool", "--color", ""]), colors);
+    assert_eq!(run(&mut cmd, &["tool", "--format", ""]), vec!["json", "yaml"]);
+}
+
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
     let input = args.as_ref();
     let mut args = vec![std::ffi::OsString::from(cmd.get_name())];

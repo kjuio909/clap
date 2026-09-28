@@ -61,8 +61,14 @@ pub fn complete(
     let mut pos_index = 1;
     let mut is_escaped = false;
     let mut next_state = ParseState::ValueDone;
+    // Options (identified through a finite set of possible values) that have
+    // already occurred on the command line.  Only such options are tracked:
+    // free-form and user-provided candidates cannot be validated, so they keep
+    // the historical lenient behavior.  State is rebuilt for every call, so a
+    // previous success or failure never leaks into the next completion.
+    let mut occurrences = std::collections::HashSet::new();
     while let Some(arg) = raw_args.next(&mut cursor) {
-        let current_state = next_state;
+        let mut current_state = next_state;
         next_state = ParseState::ValueDone;
         debug!(
             "complete::next: arg={:?}, current_state={current_state:?}, cursor={cursor:?}",
@@ -76,14 +82,20 @@ pub fn complete(
                 pos_index,
                 is_escaped,
                 current_state,
+                &occurrences,
             );
         }
-
-        if let Ok(value) = arg.to_value() {
-            if let Some(next_cmd) = current_cmd.find_subcommand(value) {
-                current_cmd = next_cmd;
-                pos_index = 1;
-                continue;
+        // A pending option always claims ordinary values; a subcommand name is
+        // only recognized once no option is waiting for a value, matching
+        // clap's own parser.
+        if matches!(current_state, ParseState::ValueDone) {
+            if let Ok(value) = arg.to_value() {
+                if let Some(next_cmd) = current_cmd.find_subcommand(value) {
+                    current_cmd = next_cmd;
+                    pos_index = 1;
+                    occurrences.clear();
+                    continue;
+                }
             }
         }
 
@@ -91,14 +103,57 @@ pub fn complete(
             (next_state, pos_index) =
                 parse_positional(current_cmd, pos_index, is_escaped, current_state);
         } else if arg.is_escape() {
-            is_escaped = true;
+            match current_state {
+                // An option that accepts hyphenated values treats `--` as one of
+                // its values, just like clap's parser.
+                ParseState::Opt((opt, count)) if opt.is_allow_hyphen_values_set() => {
+                    if !validate_opt_value(opt, arg.to_value_os()) {
+                        debug!("complete: invalid hyphen value for {}", opt.get_id());
+                        return Ok(Vec::new());
+                    }
+                    next_state = parse_opt_value(opt, count);
+                }
+                // Otherwise `--` ends the pending option when all required
+                // values are present; a still-required option makes the line
+                // invalid.
+                ParseState::Opt((opt, count))
+                    if count.saturating_sub(1)
+                        >= opt.get_num_args().expect("built").min_values() =>
+                {
+                    is_escaped = true;
+                }
+                ParseState::Opt(..) => {
+                    debug!("complete: escape while option still requires a value");
+                    return Ok(Vec::new());
+                }
+                _ => is_escaped = true,
+            }
         } else if opt_allows_hyphen(&current_state, &arg) {
             match current_state {
-                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                ParseState::Opt((opt, count)) => {
+                    if !validate_opt_value(opt, arg.to_value_os()) {
+                        debug!("complete: invalid hyphen value for {}", opt.get_id());
+                        return Ok(Vec::new());
+                    }
+                    occurrences.insert(opt.get_id().clone());
+                    next_state = parse_opt_value(opt, count);
+                }
                 _ => unreachable!("else branch is only reachable in Opt state"),
             }
         } else if let Some((flag, value)) = arg.to_long() {
             if let Ok(flag) = flag {
+                // A token that looks like an option while a previous option is
+                // waiting for a value either omits the previous option (when its
+                // optional value may be skipped) or makes the whole line invalid
+                // (when a required value is missing).
+                match omit_or_require_opt(&current_state, &arg) {
+                    PendingOpt::Omit => {
+                        current_state = ParseState::ValueDone;
+                    }
+                    PendingOpt::MissingValue => return Ok(Vec::new()),
+                    PendingOpt::None => {}
+                }
+
                 let opt = current_cmd.get_arguments().find(|a| {
                     let longs = a.get_long_and_visible_aliases();
                     let is_find = longs.map(|v| {
@@ -110,9 +165,30 @@ pub fn complete(
                 });
 
                 if let Some(opt) = opt {
-                    if opt.get_num_args().expect("built").takes_values() && value.is_none() {
-                        next_state = ParseState::Opt((opt, 1));
-                    };
+                    if option_blocked(current_cmd, opt, &occurrences) {
+                        debug!("complete: repeated non-repeatable option={flag:?}");
+                        return Ok(Vec::new());
+                    }
+                    let takes_values = opt.get_num_args().expect("built").takes_values();
+                    match value {
+                        // The value is attached with `=`; validate it before the
+                        // occurrence is recorded.
+                        Some(value) if takes_values => {
+                            if !validate_opt_value(opt, value) {
+                                debug!("complete: invalid attached value for {flag:?}");
+                                return Ok(Vec::new());
+                            }
+                            occurrences.insert(opt.get_id().clone());
+                        }
+                        // A value-taking option without an attached value waits
+                        // for the next token; the occurrence is recorded only as
+                        // its value gets committed, so the option's own pending
+                        // value position is not treated as a repeat.
+                        None if takes_values => {
+                            next_state = ParseState::Opt((opt, 1));
+                        }
+                        _ => {}
+                    }
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
@@ -122,9 +198,30 @@ pub fn complete(
                 }
             }
         } else if let Some(short) = arg.to_short() {
+            // A short cluster interacts with a pending option just like a long
+            // flag: it omits the previous option when its required values are
+            // present, or makes the line invalid.
+            match omit_or_require_opt(&current_state, &arg) {
+                PendingOpt::Omit => current_state = ParseState::ValueDone,
+                PendingOpt::MissingValue => return Ok(Vec::new()),
+                PendingOpt::None => {}
+            }
             let (_, takes_value_opt, mut short) = parse_shortflags(current_cmd, short);
             if let Some(opt) = takes_value_opt {
-                if short.next_value_os().is_none() {
+                if option_blocked(current_cmd, opt, &occurrences) {
+                    debug!(
+                        "complete: repeated non-repeatable short option={:?}",
+                        opt.get_id()
+                    );
+                    return Ok(Vec::new());
+                }
+                if let Some(value) = short.next_value_os() {
+                    if !validate_opt_value(opt, value) {
+                        debug!("complete: invalid attached value for {}", opt.get_id());
+                        return Ok(Vec::new());
+                    }
+                    occurrences.insert(opt.get_id().clone());
+                } else {
                     next_state = ParseState::Opt((opt, 1));
                 }
             } else if pos_allows_hyphen(current_cmd, pos_index) {
@@ -144,12 +241,109 @@ pub fn complete(
                     (next_state, pos_index) =
                         parse_positional(current_cmd, pos_index, is_escaped, current_state);
                 }
-                ParseState::Opt((opt, count)) => next_state = parse_opt_value(opt, count),
+                ParseState::Opt((opt, count)) => {
+                    if !validate_opt_value(opt, arg.to_value_os()) {
+                        debug!("complete: invalid value for {}", opt.get_id());
+                        return Ok(Vec::new());
+                    }
+                    occurrences.insert(opt.get_id().clone());
+                    next_state = parse_opt_value(opt, count);
+                }
             }
         }
     }
 
     Err(std::io::Error::other("no completion generated"))
+}
+
+/// How a flag-like token interacts with an option that is still waiting for a
+/// value.
+enum PendingOpt {
+    /// The pending option takes no more required values; reset the parse state
+    /// and process the token on its own.
+    Omit,
+    /// The pending option still requires a value, so the command line is invalid.
+    MissingValue,
+    /// No option is pending (or the token is its hyphenated value).
+    None,
+}
+
+/// Decide whether a flag-like token omits the pending option or witnesses a
+/// missing required value.
+fn omit_or_require_opt(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> PendingOpt {
+    let ParseState::Opt((opt, count)) = state else {
+        return PendingOpt::None;
+    };
+    if opt.is_allow_hyphen_values_set() {
+        return PendingOpt::None;
+    }
+    // This helper is only reached for tokens already recognized as long or
+    // short flags (the `--` escape is handled by its own branch), so the token
+    // is always flag-like here.
+    let is_flag_like = arg.is_long() || (arg.to_short().is_some() && !arg.is_negative_number());
+    if !is_flag_like {
+        return PendingOpt::None;
+    }
+    let consumed = count.saturating_sub(1);
+    if consumed >= opt.get_num_args().expect("built").min_values() {
+        // The option already has all its required values, so this token starts
+        // something new.
+        PendingOpt::Omit
+    } else {
+        PendingOpt::MissingValue
+    }
+}
+
+/// Whether an option may no longer be offered because it already occurred and
+/// cannot be repeated.
+///
+/// Only options with a finite set of possible values are restricted: their
+/// values and occurrences can be validated.  Free-form arguments and arguments
+/// with user-supplied candidate providers keep the historical lenient behavior.
+fn option_blocked(
+    cmd: &clap::Command,
+    opt: &clap::Arg,
+    occurrences: &std::collections::HashSet<clap::Id>,
+) -> bool {
+    if !opt.get_num_args().expect("built").takes_values() {
+        return false;
+    }
+    if possible_values(opt).is_none() {
+        return false;
+    }
+    if cmd.is_args_override_self() {
+        return false;
+    }
+    matches!(opt.get_action(), clap::ArgAction::Set) && occurrences.contains(opt.get_id())
+}
+
+/// Check a committed option value against the option's finite possible values.
+///
+/// Options without a finite value set (free-form values, user-provided candidate
+/// providers, paths) are always accepted.  With a value delimiter, every
+/// delimiter-separated segment must be valid.
+fn validate_opt_value(opt: &clap::Arg, value: &OsStr) -> bool {
+    let Some(possible) = possible_values(opt) else {
+        return true;
+    };
+    let valid: Vec<String> = possible
+        .flat_map(|p| {
+            p.get_name_and_aliases()
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    let value = match value.to_str() {
+        Some(value) => value,
+        None => return false,
+    };
+    let segments: Box<dyn Iterator<Item = &str>> = match opt.get_value_delimiter() {
+        Some(delimiter) => Box::new(value.split(delimiter)),
+        None => Box::new(std::iter::once(value)),
+    };
+    segments
+        .into_iter()
+        .all(|segment| valid.iter().any(|v| v == segment))
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]
@@ -171,6 +365,7 @@ fn complete_arg(
     pos_index: usize,
     is_escaped: bool,
     state: ParseState<'_>,
+    occurrences: &std::collections::HashSet<clap::Id>,
 ) -> Result<Vec<CompletionCandidate>, std::io::Error> {
     debug!(
         "complete_arg: arg={:?}, cmd={:?}, current_dir={:?}, pos_index={:?}, state={:?}",
@@ -204,7 +399,7 @@ fn complete_arg(
                 ));
             }
             if !is_escaped {
-                completions.extend(complete_option(arg, cmd, current_dir));
+                completions.extend(complete_option(arg, cmd, current_dir, occurrences));
             }
         }
         ParseState::Pos((_, num_arg)) => {
@@ -223,7 +418,7 @@ fn complete_arg(
                         .get_num_args()
                         .is_some_and(|num_args| num_arg >= num_args.min_values())
                 {
-                    completions.extend(complete_option(arg, cmd, current_dir));
+                    completions.extend(complete_option(arg, cmd, current_dir, occurrences));
                 }
             }
         }
@@ -235,7 +430,13 @@ fn complete_arg(
                 count.saturating_sub(1),
             ));
             let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
-            if count > min {
+            // Only fall back to positional/flag/subcommand completion once the
+            // option's minimum is satisfied *and* at least one value was
+            // actually supplied.  This keeps an empty value position of an
+            // optional single-value option (e.g. `--color `) focused on the
+            // option's values instead of leaking flags and positionals.
+            let consumed = count.saturating_sub(1);
+            if consumed >= 1 && consumed >= min {
                 // Also complete this raw_arg as a positional argument, flags, options and subcommand.
                 completions.extend(complete_arg(
                     arg,
@@ -244,6 +445,7 @@ fn complete_arg(
                     pos_index,
                     is_escaped,
                     ParseState::ValueDone,
+                    occurrences,
                 )?);
             }
         }
@@ -284,6 +486,7 @@ fn complete_option(
     arg: &clap_lex::ParsedArg<'_>,
     cmd: &clap::Command,
     current_dir: Option<&std::path::Path>,
+    occurrences: &std::collections::HashSet<clap::Id>,
 ) -> Vec<CompletionCandidate> {
     debug!("complete_option: arg={arg:?}, current_dir={current_dir:?}");
     let mut completions = Vec::<CompletionCandidate>::new();
@@ -324,11 +527,16 @@ fn complete_option(
         if let Ok(flag) = flag {
             if let Some(value) = value {
                 if let Some(arg) = cmd.get_arguments().find(|a| a.get_long() == Some(flag)) {
-                    completions.extend(
-                        complete_arg_value(value.to_str().ok_or(value), arg, current_dir, 0)
-                            .into_iter()
-                            .map(|comp| comp.add_prefix(format!("--{flag}="))),
-                    );
+                    // Supplying a value with `=` to an option that already
+                    // occurred and cannot be repeated is invalid; the flag name
+                    // itself may still be listed, but it offers no values.
+                    if !option_blocked(cmd, arg, occurrences) {
+                        completions.extend(
+                            complete_arg_value(value.to_str().ok_or(value), arg, current_dir, 0)
+                                .into_iter()
+                                .map(|comp| comp.add_prefix(format!("--{flag}="))),
+                        );
+                    }
                 }
             } else {
                 completions.extend(
@@ -350,23 +558,25 @@ fn complete_option(
 
             // Clone `short` to `peek_short` to peek whether the next flag is a `=`.
             if let Some(opt) = takes_value_opt {
-                let mut peek_short = short.clone();
-                let has_equal = if let Some(Ok('=')) = peek_short.next_flag() {
-                    short.next_flag();
-                    true
-                } else {
-                    false
-                };
+                if !option_blocked(cmd, opt, occurrences) {
+                    let mut peek_short = short.clone();
+                    let has_equal = if let Some(Ok('=')) = peek_short.next_flag() {
+                        short.next_flag();
+                        true
+                    } else {
+                        false
+                    };
 
-                let value = short.next_value_os().unwrap_or(OsStr::new(""));
-                completions.extend(
-                    complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0)
-                        .into_iter()
-                        .map(|comp| {
-                            let sep = if has_equal { "=" } else { "" };
-                            comp.add_prefix(format!("-{leading_flags}{sep}"))
-                        }),
-                );
+                    let value = short.next_value_os().unwrap_or(OsStr::new(""));
+                    completions.extend(
+                        complete_arg_value(value.to_str().ok_or(value), opt, current_dir, 0)
+                            .into_iter()
+                            .map(|comp| {
+                                let sep = if has_equal { "=" } else { "" };
+                                comp.add_prefix(format!("-{leading_flags}{sep}"))
+                            }),
+                    );
+                }
             } else {
                 completions.extend(
                     shorts_and_visible_aliases(cmd)
