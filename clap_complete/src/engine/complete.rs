@@ -77,7 +77,10 @@ pub fn complete(
             {
                 return Err(std::io::Error::other("no completion generated"));
             }
-            let disabled = gather_disabled_args(current_cmd, &explicit_opts);
+            let disabled = DisabledArgs {
+                hidden: gather_disabled_args(current_cmd, &explicit_opts),
+                present: explicit_opts.clone(),
+            };
             return complete_arg(
                 &arg,
                 current_cmd,
@@ -138,37 +141,34 @@ pub fn complete(
             }
         }
 
-        // While a dangling delimiter makes the next segment mandatory
-        // (`--opt=a,`), a closed word may only be that segment.  An option
-        // word (recognized or not) or `--` cannot fill it and clap rejects the
-        // line, so completion reports an error instead of guessing a stop or a
-        // new option. An option with `allow_hyphen_values` still accepts a
-        // hyphen-prefixed word as the segment. A plain value word below is
-        // consumed as the segment.
-        if let ParseState::Opt(state) = &current_state {
-            if state.open && !is_escaped && !opt_allows_hyphen(&current_state, &arg) {
-                let is_option_word = arg.is_escape()
-                    || arg.to_long().is_some()
-                    || arg
-                        .to_short()
-                        .is_some_and(|short| !short.is_negative_number());
-                if is_option_word {
-                    is_illegal = true;
-                }
-            }
-        }
-
         // Once the value occurrence is complete, only the standalone terminator
         // still belongs to it; any other word resumes ordinary option/positional
         // parsing. This one-word window makes the terminator work identically
         // across `=`, separate words, shorts and aliases.
-        let dispatch_state = if matches!(&current_state, ParseState::Opt(state) if state.closed)
+        let mut dispatch_state = if matches!(&current_state, ParseState::Opt(state) if state.closed)
             && consumed_terminator.is_none()
         {
             ParseState::ValueDone
         } else {
             current_state
         };
+
+        // A closed word arriving while an option still takes value words:
+        // clap consumes every word as the value while the value is mandatory
+        // and rejects option-shaped words (a missing value) as well as
+        // unknown values; once the minimum number is met, an option word or
+        // `--` may stop the occurrence and resumes ordinary parsing instead.
+        if let ParseState::Opt(state) = &dispatch_state {
+            if consumed_terminator.is_none() && !state.closed {
+                match classify_closed_value_word(state, &arg) {
+                    ClosedValueWord::Value => {}
+                    ClosedValueWord::Illegal => is_illegal = true,
+                    ClosedValueWord::ResumeParsing => {
+                        dispatch_state = ParseState::ValueDone;
+                    }
+                }
+            }
+        }
 
         if is_escaped {
             let accepted = closed_positional_is_accepted(current_cmd, pos_index, arg.to_value_os());
@@ -181,6 +181,8 @@ pub fn complete(
                 is_illegal = true;
             }
         } else if arg.is_escape() {
+            // `classify_closed_value_word` already rejected a `--` that arrives
+            // while a value is mandatory (and rewrote the state otherwise).
             is_escaped = true;
         } else if consumed_terminator.is_some() {
             next_state = ParseState::ValueDone;
@@ -204,6 +206,11 @@ pub fn complete(
                 });
 
                 if let Some(opt) = opt {
+                    // A non-repeatable option used twice (across words) cannot
+                    // be part of a valid command line.
+                    if !arg_is_repeatable(opt) && explicit_opts.contains(opt.get_id()) {
+                        is_illegal = true;
+                    }
                     explicit_opts.insert(opt.get_id().clone());
                     if opt.get_num_args().expect("built").takes_values() {
                         match value {
@@ -235,47 +242,74 @@ pub fn complete(
                 is_illegal = true;
             }
         } else if let Some(short) = arg.to_short() {
-            let (leading_flags, takes_value_opt, mut short, cluster_valid) =
-                parse_shortflags(current_cmd, short);
-            // Only a cluster made entirely of recognized flags records state.
-            // Splitting an invalid short string into known and unknown members
-            // would be guesswork and could suppress conflicting candidates, so
-            // invalid clusters keep the existing completion behavior; clap's
-            // parser would reject them anyway.
-            if cluster_valid {
-                // Every recognized flag in the cluster was explicitly supplied.
-                for flag in leading_flags.chars() {
-                    if let Some(opt) = current_cmd.get_arguments().find(|a| {
-                        a.get_short_and_visible_aliases()
-                            .is_some_and(|shorts| shorts.contains(&flag))
-                    }) {
-                        explicit_opts.insert(opt.get_id().clone());
+            if short.is_negative_number() {
+                // A number-shaped word only fills the waiting option when it
+                // accepts it; otherwise it is either a negative positional
+                // value or, like clap, an unknown argument, never a cluster.
+                match dispatch_state {
+                    ParseState::Opt(state) => {
+                        next_state = advance_opt_value(state, arg.to_value_os(), &mut is_illegal);
+                    }
+                    _ => {
+                        if pos_allows_negative(current_cmd, pos_index) {
+                            let accepted = closed_positional_is_accepted(
+                                current_cmd,
+                                pos_index,
+                                arg.to_value_os(),
+                            );
+                            (next_state, pos_index) = parse_positional(
+                                current_cmd,
+                                pos_index,
+                                is_escaped,
+                                dispatch_state,
+                            );
+                            if !accepted {
+                                is_illegal = true;
+                            }
+                        } else {
+                            is_illegal = true;
+                        }
+                    }
+                }
+            } else {
+                let cluster = scan_short_cluster(current_cmd, short);
+                let structurally_valid = cluster.flags_valid && !cluster.duplicate;
+
+                // A positional that accepts hyphenated values swallows a word
+                // that is not entirely made of recognized flags; clap's parser
+                // treats it as the positional value.
+                if !structurally_valid && pos_allows_hyphen(current_cmd, pos_index) {
+                    let accepted =
+                        closed_positional_is_accepted(current_cmd, pos_index, arg.to_value_os());
+                    (next_state, pos_index) =
+                        parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
+                    if !accepted {
+                        is_illegal = true;
+                    }
+                } else if !structurally_valid {
+                    // An unknown member, an empty cluster or a repeated
+                    // non-repeatable flag makes the cluster illegal as a whole:
+                    // never split it or accept part of it.
+                    is_illegal = true;
+                } else {
+                    // Every flag of the recognized cluster was explicitly
+                    // supplied; a repeated non-repeatable option is rejected.
+                    handle_closed_cluster(&cluster, &mut explicit_opts, &mut is_illegal);
+                    if let Some(opt) = cluster.takes_value_opt {
+                        let mut value_flags = cluster.value_flags.clone();
+                        match value_flags.next_value_os() {
+                            // A closed `-ovalue` / `-o=value` word; advance like
+                            // the long `--opt=value` form.
+                            Some(remainder) => {
+                                let value = remainder.strip_prefix("=").unwrap_or(remainder);
+                                next_state = attached_opt_state(opt, value, &mut is_illegal);
+                            }
+                            // A bare `-o` still expects its value next word.
+                            None => next_state = ParseState::Opt(OptState::new(opt, 1)),
+                        }
                     }
                 }
             }
-            if let Some(opt) = takes_value_opt {
-                if let Some(remainder) = short.next_value_os() {
-                    // A closed `-ovalue` / `-o=value` word; advance like the
-                    // long `--opt=value` form.
-                    let value = remainder.strip_prefix("=").unwrap_or(remainder);
-                    next_state = attached_opt_state(opt, value, &mut is_illegal);
-                } else {
-                    next_state = ParseState::Opt(OptState::new(opt, 1));
-                }
-            } else if pos_allows_hyphen(current_cmd, pos_index) {
-                let accepted =
-                    closed_positional_is_accepted(current_cmd, pos_index, arg.to_value_os());
-                (next_state, pos_index) =
-                    parse_positional(current_cmd, pos_index, is_escaped, dispatch_state);
-                if !accepted {
-                    is_illegal = true;
-                }
-            }
-            // An invalid short cluster (an unknown member, or no
-            // value-taking option) deliberately keeps the legacy completion
-            // behavior rather than flagging the line: its members are not
-            // guessed apart, and the cursor word still completes on this
-            // level.
         } else {
             match dispatch_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
@@ -413,6 +447,13 @@ fn consume_opt_word<'a>(
     let Some(delim) = is_bounded_delimited(opt) else {
         // Legacy behavior: count whole shell words against the range; whatever
         // is packed behind a delimiter does not extend or shorten the count.
+        // A closed word that names none of the option's fixed values (an
+        // unknown value, an empty value, or text glued onto a complete value
+        // such as `3v`) cannot be part of a valid command line. Free-form
+        // options keep accepting every word.
+        if !closed_word_value_is_known(opt, value) {
+            return Err(());
+        }
         // An attached value always closes the occurrence.
         return Ok(if !attached && ordinal < max {
             Some(OptState {
@@ -604,7 +645,7 @@ fn complete_arg(
     pos_index: usize,
     is_escaped: bool,
     state: ParseState<'_>,
-    disabled: &HashSet<Id>,
+    disabled: &DisabledArgs,
 ) -> Result<Vec<CompletionCandidate>, std::io::Error> {
     debug!(
         "complete_arg: arg={:?}, cmd={:?}, current_dir={:?}, pos_index={:?}, state={:?}",
@@ -646,7 +687,7 @@ fn complete_arg(
                 .get_positionals()
                 .find(|p| p.get_index() == Some(pos_index))
             {
-                if !disabled.contains(positional.get_id()) {
+                if !disabled.hidden.contains(positional.get_id()) {
                     completions.extend(complete_arg_value(
                         arg.to_value(),
                         positional,
@@ -656,7 +697,7 @@ fn complete_arg(
                 }
             }
             if !is_escaped {
-                completions.extend(complete_option(arg, cmd, current_dir, disabled));
+                completions.extend(complete_option(arg, cmd, current_dir, disabled)?);
             }
         }
         ParseState::Pos((_, num_arg)) => {
@@ -664,7 +705,7 @@ fn complete_arg(
                 .get_positionals()
                 .find(|p| p.get_index() == Some(pos_index))
             {
-                if !disabled.contains(positional.get_id()) {
+                if !disabled.hidden.contains(positional.get_id()) {
                     completions.extend(complete_arg_value(
                         arg.to_value(),
                         positional,
@@ -677,7 +718,7 @@ fn complete_arg(
                         .get_num_args()
                         .is_some_and(|num_args| num_arg >= num_args.min_values())
                 {
-                    completions.extend(complete_option(arg, cmd, current_dir, disabled));
+                    completions.extend(complete_option(arg, cmd, current_dir, disabled)?);
                 }
             }
         }
@@ -724,7 +765,14 @@ fn complete_arg(
                     );
                 }
             }
-            if !disabled.contains(opt.get_id()) {
+            // Offer this waiting option's own values. It is normally offered
+            // even when its own (recorded) spelling put it in the hidden set,
+            // but not when a *different* option already present conflicts with
+            // it: then clap rejects the line regardless and its values stay
+            // hidden, preserving the established conflict behavior.
+            if !disabled.hidden.contains(opt.get_id())
+                || !disabled.hidden_by_present_conflict(cmd, opt)
+            {
                 match complete_separate_opt_value(arg.to_value(), &state, current_dir) {
                     Ok(values) => completions.extend(values),
                     // The cursor sits at an illegal segment position (an empty
@@ -825,6 +873,11 @@ fn complete_segment_value(
             }
         }
     }
+    // Text glued onto a complete possible value (`3v`, `-3v`) cannot be a
+    // value nor a following short cluster; the word is illegal as a whole.
+    if glued_fixed_value_is_illegal(opt, value) {
+        return Err(());
+    }
     let Some(cursor) = cursor_delimited(opt, value, prior_segments)? else {
         // Not a bounded delimiter option: keep the legacy whole-word
         // completion (its own `rsplit_delimiter` handles single-value args).
@@ -899,7 +952,7 @@ fn complete_inline_option_value(
     arg: &clap_lex::ParsedArg<'_>,
     cmd: &clap::Command,
     current_dir: Option<&std::path::Path>,
-    disabled: &HashSet<Id>,
+    disabled: &DisabledArgs,
 ) -> Option<Result<Vec<CompletionCandidate>, ()>> {
     if let Some((flag, value)) = arg.to_long() {
         let flag = flag.ok()?;
@@ -912,7 +965,7 @@ fn complete_inline_option_value(
         if !opt.get_num_args().expect("built").takes_values() {
             return None;
         }
-        if disabled.contains(opt.get_id()) {
+        if disabled.hidden.contains(opt.get_id()) {
             return Some(Ok(Vec::new()));
         }
         let prefix = format!("--{flag}=");
@@ -930,16 +983,23 @@ fn complete_inline_option_value(
     if short.is_negative_number() {
         return None;
     }
-    let (leading_flags, opt, mut value_flags, _) = parse_shortflags(cmd, short);
-    let opt = opt?;
+    let cluster = scan_short_cluster(cmd, short);
+    let opt = cluster.takes_value_opt?;
 
     // Detect an attached value: once the cluster reaches its value-taking
     // flag, everything left is the value, optionally introduced by `=`.  With
     // no remainder and no `=` (`-o`), the word is left to the regular option
     // completion, which already offers inline values.
+    let mut value_flags = cluster.value_flags.clone();
     let mut peek = value_flags.clone();
     let has_equal = matches!(peek.next_flag(), Some(Ok('=')));
     if !has_equal && value_flags.is_empty() {
+        return None;
+    }
+    // An unknown or repeated flag before the taking flag leaves the word to
+    // regular option completion; such a cluster cannot carry this option's
+    // value.
+    if !cluster.flags_valid || cluster.duplicate {
         return None;
     }
     if has_equal {
@@ -947,12 +1007,12 @@ fn complete_inline_option_value(
         // for `-o=`), matching the space-separated empty-value position.
         value_flags.next_flag();
     }
-    if disabled.contains(opt.get_id()) {
+    if disabled.hidden.contains(opt.get_id()) {
         return Some(Ok(Vec::new()));
     }
     let value = value_flags.next_value_os().unwrap_or(OsStr::new(""));
     let sep = if has_equal { "=" } else { "" };
-    let prefix = format!("-{leading_flags}{sep}");
+    let prefix = format!("-{}{sep}", cluster.leading_flags);
     Some(
         complete_segment_value(value, opt, 0, &[], 0, current_dir).map(|values| {
             values
@@ -967,13 +1027,13 @@ fn complete_option(
     arg: &clap_lex::ParsedArg<'_>,
     cmd: &clap::Command,
     current_dir: Option<&std::path::Path>,
-    disabled: &HashSet<Id>,
-) -> Vec<CompletionCandidate> {
+    disabled: &DisabledArgs,
+) -> Result<Vec<CompletionCandidate>, std::io::Error> {
     debug!("complete_option: arg={arg:?}, current_dir={current_dir:?}");
     let mut completions = Vec::<CompletionCandidate>::new();
     if arg.is_empty() {
-        completions.extend(longs_and_visible_aliases(cmd, disabled));
-        completions.extend(hidden_longs_aliases(cmd, disabled));
+        completions.extend(longs_and_visible_aliases(cmd, &disabled.hidden));
+        completions.extend(hidden_longs_aliases(cmd, &disabled.hidden));
 
         let dash_or_arg = if arg.is_empty() {
             "-".into()
@@ -981,7 +1041,7 @@ fn complete_option(
             arg.to_value_os().to_string_lossy()
         };
         completions.extend(
-            shorts_and_visible_aliases(cmd, disabled)
+            shorts_and_visible_aliases(cmd, &disabled.hidden)
                 .into_iter()
                 .map(|comp| comp.add_prefix(dash_or_arg.to_string())),
         );
@@ -993,17 +1053,17 @@ fn complete_option(
             arg.to_value_os().to_string_lossy()
         };
         completions.extend(
-            shorts_and_visible_aliases(cmd, disabled)
+            shorts_and_visible_aliases(cmd, &disabled.hidden)
                 .into_iter()
                 .map(|comp| comp.add_prefix(dash_or_arg.to_string())),
         );
 
-        completions.extend(longs_and_visible_aliases(cmd, disabled));
-        completions.extend(hidden_longs_aliases(cmd, disabled));
+        completions.extend(longs_and_visible_aliases(cmd, &disabled.hidden));
+        completions.extend(hidden_longs_aliases(cmd, &disabled.hidden));
     } else if arg.is_escape() {
         // HACK: Assuming knowledge of is_escape
-        completions.extend(longs_and_visible_aliases(cmd, disabled));
-        completions.extend(hidden_longs_aliases(cmd, disabled));
+        completions.extend(longs_and_visible_aliases(cmd, &disabled.hidden));
+        completions.extend(hidden_longs_aliases(cmd, &disabled.hidden));
     } else if let Some((flag, value)) = arg.to_long() {
         if let Ok(flag) = flag {
             if let Some(value) = value {
@@ -1012,26 +1072,31 @@ fn complete_option(
                         .is_some_and(|longs| longs.into_iter().any(|long| long == flag))
                 });
                 if let Some(arg) = opt {
-                    if !disabled.contains(arg.get_id()) {
-                        if let Ok(values) =
-                            complete_segment_value(value, arg, 0, &[], 0, current_dir)
-                        {
-                            completions.extend(
-                                values
-                                    .into_iter()
-                                    .map(|comp| comp.add_prefix(format!("--{flag}="))),
-                            );
+                    if !disabled.hidden.contains(arg.get_id()) {
+                        match complete_segment_value(value, arg, 0, &[], 0, current_dir) {
+                            Ok(values) => {
+                                completions.extend(
+                                    values
+                                        .into_iter()
+                                        .map(|comp| comp.add_prefix(format!("--{flag}="))),
+                                );
+                            }
+                            // An illegal mixed word (text glued onto a
+                            // complete value) completes to nothing.
+                            Err(()) => {
+                                return Err(std::io::Error::other("no completion generated"));
+                            }
                         }
                     }
                 }
             } else {
                 completions.extend(
-                    longs_and_visible_aliases(cmd, disabled)
+                    longs_and_visible_aliases(cmd, &disabled.hidden)
                         .into_iter()
                         .filter(|comp| comp.get_value().starts_with(format!("--{flag}").as_str())),
                 );
                 completions.extend(
-                    hidden_longs_aliases(cmd, disabled)
+                    hidden_longs_aliases(cmd, &disabled.hidden)
                         .into_iter()
                         .filter(|comp| comp.get_value().starts_with(format!("--{flag}").as_str())),
                 );
@@ -1039,39 +1104,69 @@ fn complete_option(
         }
     } else if let Some(short) = arg.to_short() {
         if !short.is_negative_number() {
-            // Find the first takes_values option.
-            let (leading_flags, takes_value_opt, mut short, _) = parse_shortflags(cmd, short);
+            let cluster = scan_short_cluster(cmd, short);
+            // A cluster carrying an unknown member or repeating a
+            // non-repeatable flag is illegal at the cursor too: it is never a
+            // prefix of a valid command line, so completion errors rather than
+            // offering flags that could be appended to an invalid word.
+            if !cluster.flags_valid || cluster.duplicate {
+                return Err(std::io::Error::other("no completion generated"));
+            }
 
-            // Clone `short` to `peek_short` to peek whether the next flag is a `=`.
-            if let Some(opt) = takes_value_opt {
-                if !disabled.contains(opt.get_id()) {
-                    let mut peek_short = short.clone();
+            if let Some(opt) = cluster.takes_value_opt {
+                if !disabled.hidden.contains(opt.get_id()) {
+                    let mut value_flags = cluster.value_flags.clone();
+                    let mut peek_short = value_flags.clone();
                     let has_equal = if let Some(Ok('=')) = peek_short.next_flag() {
-                        short.next_flag();
+                        value_flags.next_flag();
                         true
                     } else {
                         false
                     };
 
-                    let value = short.next_value_os().unwrap_or(OsStr::new(""));
-                    if let Ok(values) = complete_segment_value(value, opt, 0, &[], 0, current_dir) {
-                        completions.extend(values.into_iter().map(|comp| {
-                            let sep = if has_equal { "=" } else { "" };
-                            comp.add_prefix(format!("-{leading_flags}{sep}"))
-                        }));
+                    let value = value_flags.next_value_os().unwrap_or(OsStr::new(""));
+                    match complete_segment_value(value, opt, 0, &[], 0, current_dir) {
+                        Ok(values) => {
+                            completions.extend(values.into_iter().map(|comp| {
+                                let sep = if has_equal { "=" } else { "" };
+                                comp.add_prefix(format!("-{}{sep}", cluster.leading_flags))
+                            }));
+                        }
+                        // A value with short letters glued onto a complete
+                        // possible value is an illegal mixed word, never a
+                        // partial cluster.
+                        Err(()) => return Err(std::io::Error::other("no completion generated")),
                     }
                 }
             } else {
+                // Offer another flag to append to the cluster. A flag already
+                // written in this cluster is offered again only when it is
+                // repeatable (`Count`/`Append`); appending it otherwise would
+                // build an illegal repeated cluster such as `-vv`.
+                let written: Vec<char> = cluster.leading_flags.chars().collect();
                 completions.extend(
-                    shorts_and_visible_aliases(cmd, disabled)
+                    shorts_and_visible_aliases(cmd, &disabled.hidden)
                         .into_iter()
-                        .map(|comp| comp.add_prefix(format!("-{leading_flags}"))),
+                        .filter(|comp| {
+                            let ch = comp
+                                .get_value()
+                                .to_str()
+                                .and_then(|s| s.chars().next())
+                                .unwrap_or_default();
+                            if let Some(arg) = find_short_arg(cmd, ch) {
+                                if !arg_is_repeatable(arg) && written.contains(&ch) {
+                                    return false;
+                                }
+                            }
+                            true
+                        })
+                        .map(|comp| comp.add_prefix(format!("-{}", cluster.leading_flags))),
                 );
             }
         }
     }
     debug!("complete_option: completions={completions:?}");
-    completions
+    Ok(completions)
 }
 
 fn complete_arg_value(
@@ -1436,60 +1531,171 @@ fn populate_command_candidate(
         .hide(subcommand.is_hide_set())
 }
 
-/// Parse the short flags and find the first `takes_values` option.
+/// Result of scanning a short cluster up to its first value-taking option.
+#[derive(Debug)]
+struct ShortCluster<'c, 's> {
+    /// Flag characters scanned before the value-taking option, in order.
+    leading_flags: String,
+    /// Arguments those leading flags resolve to. `None` marks a character that
+    /// names no option, so the entries line up with `leading_flags`.
+    leading_args: Vec<Option<&'c clap::Arg>>,
+    /// The first option that takes a value, if the cluster reached one.
+    takes_value_opt: Option<&'c clap::Arg>,
+    /// Iterator positioned right after the taking flag, exposing any attached
+    /// value (`-ovalue` / `-o=value`).
+    value_flags: clap_lex::ShortFlags<'s>,
+    /// Every scanned member was a recognized option (or the taking option);
+    /// an unknown character or invalid UTF-8 makes this `false`.
+    flags_valid: bool,
+    /// A non-repeatable leading flag occurs more than once in the cluster
+    /// (e.g. `-vv` for a `SetTrue` flag).
+    duplicate: bool,
+}
+
+/// Scan the short flags and find the first `takes_values` option.
 ///
-/// The returned bool is `true` only when every scanned cluster member was a
-/// recognized option. Anything after the first value-taking option is the
-/// option's value and therefore not scanned; invalid UTF-8 and unknown short
-/// characters make the result `false`.
-fn parse_shortflags<'c, 's>(
+/// Anything after the first value-taking option is that option's attached
+/// value and therefore not scanned. A repeatable flag (`Count`/`Append`, e.g.
+/// `-cc`) is never reported as a duplicate.
+fn scan_short_cluster<'c, 's>(
     cmd: &'c clap::Command,
     mut short: clap_lex::ShortFlags<'s>,
-) -> (
-    String,
-    Option<&'c clap::Arg>,
-    clap_lex::ShortFlags<'s>,
-    bool,
-) {
-    let takes_value_opt;
+) -> ShortCluster<'c, 's> {
     let mut leading_flags = String::new();
-    let mut cluster_valid = true;
-    // Find the first takes_values option.
+    let mut leading_args: Vec<Option<&clap::Arg>> = Vec::new();
+    let mut flags_valid = true;
+    let mut duplicate = false;
     loop {
         match short.next_flag() {
-            Some(Ok(opt)) => {
-                leading_flags.push(opt);
-                let found = cmd.get_arguments().find(|a| {
-                    let shorts = a.get_short_and_visible_aliases();
-                    let is_find = shorts.map(|v| {
-                        let mut iter = v.into_iter();
-                        let c = iter.find(|c| *c == opt);
-                        c.is_some()
-                    });
-                    is_find.unwrap_or(false)
-                });
-                if let Some(opt) = found {
-                    if opt.get_num_args().expect("built").takes_values() {
-                        takes_value_opt = Some(opt);
-                        break;
+            Some(Ok(flag)) => {
+                let found = find_short_arg(cmd, flag);
+                if let Some(arg) = found {
+                    if arg.get_num_args().expect("built").takes_values() {
+                        // The taking flag stays part of the written prefix
+                        // (`-cS...`), but it is tracked separately from the
+                        // leading value-less flags.
+                        leading_flags.push(flag);
+                        return ShortCluster {
+                            leading_flags,
+                            leading_args,
+                            takes_value_opt: Some(arg),
+                            value_flags: short,
+                            flags_valid,
+                            duplicate,
+                        };
+                    }
+                    if !arg_is_repeatable(arg)
+                        && leading_args
+                            .iter()
+                            .any(|earlier| earlier.is_some_and(|a| a.get_id() == arg.get_id()))
+                    {
+                        duplicate = true;
                     }
                 } else {
-                    cluster_valid = false;
+                    flags_valid = false;
                 }
+                leading_flags.push(flag);
+                leading_args.push(found);
             }
             Some(Err(_)) => {
-                cluster_valid = false;
-                takes_value_opt = None;
+                flags_valid = false;
                 break;
             }
-            None => {
-                takes_value_opt = None;
-                break;
-            }
+            None => break,
         }
     }
 
-    (leading_flags, takes_value_opt, short, cluster_valid)
+    ShortCluster {
+        leading_flags,
+        leading_args,
+        takes_value_opt: None,
+        value_flags: short,
+        flags_valid,
+        duplicate,
+    }
+}
+
+/// Resolve a short flag character (or visible short alias) to its argument.
+fn find_short_arg(cmd: &clap::Command, flag: char) -> Option<&clap::Arg> {
+    cmd.get_arguments().find(|a| {
+        a.get_short_and_visible_aliases()
+            .is_some_and(|shorts| shorts.contains(&flag))
+    })
+}
+
+/// Whether an option may occur more than once on one command line.
+///
+/// `Count` and `Append` accept repeated occurrences; every other action
+/// conflicts with itself when clap parses it a second time.
+fn arg_is_repeatable(arg: &clap::Arg) -> bool {
+    matches!(
+        arg.get_action(),
+        clap::ArgAction::Count | clap::ArgAction::Append
+    )
+}
+
+/// Whether a closed value word names one of an option's fixed possible values.
+///
+/// Options without a fixed value set accept every word. This only covers
+/// options without a value delimiter; delimiter-separated values keep their
+/// legacy segment handling.
+fn closed_word_value_is_known(opt: &clap::Arg, value: &OsStr) -> bool {
+    if opt.get_value_delimiter().is_some() {
+        return true;
+    }
+    let Some(mut possible) = possible_values(opt) else {
+        return true;
+    };
+    let Some(value) = value.to_str() else {
+        return false;
+    };
+    let ignore_case = opt.is_ignore_case_set();
+    possible.any(|pv| pv.matches(value, ignore_case))
+}
+
+/// Whether the value under the cursor glues extra short-flag-looking text onto
+/// a complete fixed possible value, e.g. `3v` or `-3v` when `3`/`-3` are
+/// already complete values. clap rejects such a word rather than splitting the
+/// value from more flags, and completion must not read the trailing letters as a
+/// new cluster or succeed partially. A plain prefix with no match (`9`) or a
+/// numeric extension (`30`) still completes as an empty candidate list; only a
+/// glued letter marks an illegal mixed word.
+fn glued_fixed_value_is_illegal(opt: &clap::Arg, value: &OsStr) -> bool {
+    if opt.get_value_delimiter().is_some() {
+        return false;
+    }
+    let Some(possible) = possible_values(opt) else {
+        return false;
+    };
+    let Some(value) = value.to_str() else {
+        return false;
+    };
+    if value.is_empty() {
+        return false;
+    }
+    let ignore_case = opt.is_ignore_case_set();
+    let possible: Vec<_> = possible.collect();
+    if possible.iter().any(|pv| pv.matches(value, ignore_case)) {
+        // Still editing this exact value.
+        return false;
+    }
+    possible.iter().any(|pv| {
+        let name = pv.get_name();
+        match value.strip_prefix(name) {
+            Some(rest) => !rest.is_empty() && rest.starts_with(char::is_alphabetic),
+            None => false,
+        }
+    })
+}
+
+/// Whether the waiting option accepts a negative-number-looking word as its
+/// value: either it explicitly allows negative numbers or one of its fixed
+/// possible values is the word itself.
+fn opt_accepts_negative_value(opt: &clap::Arg, word: &OsStr) -> bool {
+    if opt.is_allow_negative_numbers_set() {
+        return true;
+    }
+    closed_word_value_is_known(opt, word)
 }
 
 /// Parse the positional arguments. Return the new state and the new positional index.
@@ -1550,6 +1756,13 @@ fn pos_allows_hyphen(cmd: &clap::Command, pos_index: usize) -> bool {
         .unwrap_or(false)
 }
 
+fn pos_allows_negative(cmd: &clap::Command, pos_index: usize) -> bool {
+    cmd.get_positionals()
+        .find(|a| a.get_index() == Some(pos_index))
+        .map(|p| p.is_allow_negative_numbers_set())
+        .unwrap_or(false)
+}
+
 fn opt_allows_hyphen(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> bool {
     let val = arg.to_value_os();
     if val.starts_with("-") {
@@ -1561,18 +1774,148 @@ fn opt_allows_hyphen(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> b
     false
 }
 
+/// Classification of a closed word while an option occurrence may take values.
+#[derive(Debug, PartialEq, Eq)]
+enum ClosedValueWord {
+    /// The word is consumed as the option's value.
+    Value,
+    /// The word cannot belong to the command line (missing value, unknown
+    /// value, illegal option word while a segment is mandatory).
+    Illegal,
+    /// The occurrence may stop here and the word resumes ordinary parsing.
+    ResumeParsing,
+}
+
+/// Classify a closed (already submitted) word while `state`'s option may still
+/// take value words, mirroring clap's parser:
+///
+/// * an option with `allow_hyphen_values` takes every word;
+/// * while a dangling delimiter segment is mandatory (`state.open`), every
+///   option-shaped word or `--` is illegal;
+/// * while the minimum number of value words is still owed, every word is the
+///   value, so an option word means a missing value and an unknown value is
+///   rejected;
+/// * once the minimum is met, an option word or `--` may stop the occurrence
+///   and resumes ordinary parsing, while a plain value word is validated and
+///   consumed up to the accepted number of values.
+fn classify_closed_value_word(
+    state: &OptState<'_>,
+    arg: &clap_lex::ParsedArg<'_>,
+) -> ClosedValueWord {
+    let opt = state.opt;
+    let range = opt.get_num_args().expect("built");
+    let min = range.min_values();
+    let max = range.max_values();
+    let consumed_words = state.word.saturating_sub(1);
+    let word = arg.to_value_os();
+
+    if opt.is_allow_hyphen_values_set() {
+        return ClosedValueWord::Value;
+    }
+
+    let is_option_word = arg.is_escape()
+        || arg.to_long().is_some()
+        || arg
+            .to_short()
+            .is_some_and(|short| !short.is_negative_number());
+    // A negative-number-shaped word is the option's value when the option
+    // accepts negative numbers or one of its fixed values matches the word.
+    let negative_as_value = arg
+        .to_short()
+        .is_some_and(|short| short.is_negative_number() && opt_accepts_negative_value(opt, word));
+
+    if state.open {
+        // A dangling delimiter still demands its segment.
+        if is_option_word && !negative_as_value {
+            ClosedValueWord::Illegal
+        } else {
+            ClosedValueWord::Value
+        }
+    } else if is_option_word && !negative_as_value {
+        // The occurrence still owes at least one value word: the word cannot
+        // both close the occurrence and name another option, so clap reports a
+        // missing value. Once the minimum is met, an option word is a legal
+        // stop and ordinary parsing resumes.
+        if consumed_words < min {
+            ClosedValueWord::Illegal
+        } else {
+            ClosedValueWord::ResumeParsing
+        }
+    } else if !closed_word_value_is_known(opt, word) {
+        // A plain word that is not one of the option's fixed values makes the
+        // line invalid; only a fixed value set rejects it.
+        ClosedValueWord::Illegal
+    } else if consumed_words >= max {
+        // The occurrence is full; the extra word belongs to ordinary parsing.
+        ClosedValueWord::ResumeParsing
+    } else {
+        ClosedValueWord::Value
+    }
+}
+
+/// Record the explicitly supplied flags of a structurally valid closed
+/// cluster and flag a repeated non-repeatable option.
+fn handle_closed_cluster(
+    cluster: &ShortCluster<'_, '_>,
+    explicit: &mut HashSet<Id>,
+    is_illegal: &mut bool,
+) {
+    for arg in cluster.leading_args.iter().flatten() {
+        if !arg_is_repeatable(arg) && explicit.contains(arg.get_id()) {
+            *is_illegal = true;
+        }
+        explicit.insert(arg.get_id().clone());
+    }
+    if let Some(opt) = cluster.takes_value_opt {
+        if !arg_is_repeatable(opt) && explicit.contains(opt.get_id()) {
+            *is_illegal = true;
+        }
+        explicit.insert(opt.get_id().clone());
+    }
+}
+
+/// Arguments hidden from completion at the cursor.
+#[derive(Debug, Default)]
+struct DisabledArgs {
+    /// Ids hidden from option-name and positional listings: options that
+    /// already occurred (and cannot repeat) plus every option they conflict
+    /// with.
+    hidden: HashSet<Id>,
+    /// Ids of options explicitly present in the words before the cursor. Used
+    /// to tell a self-inflicted "already present" hiding from a genuine
+    /// conflict with another present option.
+    present: HashSet<Id>,
+}
+
+impl DisabledArgs {
+    /// Whether `opt` is hidden because a *different* option already present on
+    /// the line conflicts with it. Its own presence alone is not a conflict.
+    fn hidden_by_present_conflict(&self, cmd: &clap::Command, opt: &clap::Arg) -> bool {
+        arg_direct_conflicts(cmd, opt)
+            .iter()
+            .any(|id| id != opt.get_id() && self.present.contains(id))
+    }
+}
+
 /// Arguments that must not be offered because they conflict with an explicitly
-/// present option. The present options themselves are never disabled.
-fn gather_disabled_args(cmd: &clap::Command, explicit: &HashSet<Id>) -> HashSet<Id> {
+/// present option or because they already occurred and cannot occur a second
+/// time (every action except `Count`/`Append`). Repeatable options stay
+/// available.
+fn gather_disabled_args(cmd: &clap::Command, present: &HashSet<Id>) -> HashSet<Id> {
     let mut disabled = HashSet::new();
-    if explicit.is_empty() {
+    if present.is_empty() {
         return disabled;
     }
     for arg in cmd.get_arguments() {
-        if explicit.contains(arg.get_id()) {
+        if present.contains(arg.get_id()) {
+            if !arg_is_repeatable(arg) {
+                // The option was already consumed; clap rejects a second
+                // occurrence, so its name is not offered again.
+                disabled.insert(arg.get_id().clone());
+            }
             // A present option hides everything it conflicts with ...
             for id in arg_direct_conflicts(cmd, arg) {
-                if !explicit.contains(&id) {
+                if !present.contains(&id) {
                     disabled.insert(id);
                 }
             }
@@ -1580,7 +1923,7 @@ fn gather_disabled_args(cmd: &clap::Command, explicit: &HashSet<Id>) -> HashSet<
             // ... and is hidden when either side declares the conflict.
             if arg_direct_conflicts(cmd, arg)
                 .iter()
-                .any(|id| explicit.contains(id))
+                .any(|id| present.contains(id))
             {
                 disabled.insert(arg.get_id().clone());
             }

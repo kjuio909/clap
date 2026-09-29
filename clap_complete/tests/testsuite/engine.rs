@@ -367,7 +367,6 @@ toml
 pos_a
 pos_b
 pos_c
---format
 --stream
 --count
 --help	Print help
@@ -436,7 +435,6 @@ val3
     assert_data_eq!(
         complete!(cmd, "--certain-num val1 val2 val3 [TAB]"),
         snapbox::str![[r#"
---certain-num
 --uncertain-num
 --help	Print help
 "#]]
@@ -458,7 +456,6 @@ val1
 val2
 val3
 --certain-num
---uncertain-num
 --help	Print help
 "#]]
     );
@@ -467,7 +464,6 @@ val3
         complete!(cmd, "--uncertain-num val1 val2 val3 [TAB]"),
         snapbox::str![[r#"
 --certain-num
---uncertain-num
 --help	Print help
 "#]]
     );
@@ -493,7 +489,6 @@ val3
     assert_data_eq!(
         complete!(cmd, "-Y val1 val2 val3 [TAB]"),
         snapbox::str![[r#"
---certain-num
 --uncertain-num
 --help	Print help
 "#]]
@@ -515,7 +510,6 @@ val1
 val2
 val3
 --certain-num
---uncertain-num
 --help	Print help
 "#]]
     );
@@ -524,7 +518,6 @@ val3
         complete!(cmd, "-N val1 val2 val3 [TAB]"),
         snapbox::str![[r#"
 --certain-num
---uncertain-num
 --help	Print help
 "#]]
     );
@@ -1025,7 +1018,6 @@ pos_2_c
 pos_2_a
 pos_2_b
 pos_2_c
---format
 --help	Print help
 "#]]
     );
@@ -1041,10 +1033,7 @@ pos_2_c
 
     assert_data_eq!(
         complete!(cmd, "--format json pos_1_a pos_2_a pos_2_b pos_2_c [TAB]"),
-        snapbox::str![[r#"
---format
---help	Print help
-"#]]
+        snapbox::str!["--help	Print help"]
     );
 
     assert_data_eq!(
@@ -1113,7 +1102,6 @@ toml
 pos_1_a
 pos_1_b
 pos_1_c
---format
 --help	Print help
 "#]]
     );
@@ -1150,7 +1138,6 @@ toml
 pos_1_a
 pos_1_b
 pos_1_c
---format
 --help	Print help
 "#]]
     );
@@ -1401,7 +1388,6 @@ toml
     assert_data_eq!(
         complete!(command(), "--format=json,yaml [TAB]"),
         snapbox::str![[r#"
---format
 --verbose
 --help	Print help
 "#]]
@@ -1409,7 +1395,6 @@ toml
     assert_data_eq!(
         complete!(command(), "--format json,yaml [TAB]"),
         snapbox::str![[r#"
---format
 --verbose
 --help	Print help
 "#]]
@@ -1736,7 +1721,6 @@ green
 blue
 src
 dst
---tag
 --help	Print help
 "#]];
     for input in ["--tag red [TAB]", "--label red [TAB]", "-t red [TAB]"] {
@@ -1750,7 +1734,6 @@ dst
     let closed = snapbox::str![[r#"
 src
 dst
---tag
 --help	Print help
 "#]];
     for input in [
@@ -1777,7 +1760,6 @@ fn suggest_tag_terminator_restores_parsing() {
     let after = snapbox::str![[r#"
 src
 dst
---tag
 --help	Print help
 "#]];
     for input in [
@@ -1807,7 +1789,7 @@ dst
     );
     assert_data_eq!(
         complete!(terminator_command(), "--tag red ; --t[TAB]"),
-        snapbox::str!["--tag"]
+        snapbox::str![""]
     );
 
     // A positional filled after the terminator completes normally.
@@ -1983,7 +1965,7 @@ fn suggest_tag_terminator_repeated_calls_are_stable() {
     assert_eq!(first, third);
     let literals: Vec<&str> = first.iter().map(|v| v.to_str().unwrap()).collect();
     assert!(literals.contains(&"src"));
-    assert!(literals.contains(&"--tag"));
+    assert!(!literals.contains(&"--tag"));
     assert!(!literals.contains(&"--raw"));
     assert!(!literals.contains(&";"));
 
@@ -2104,24 +2086,15 @@ yaml
 
     assert_data_eq!(
         complete!(spec_command(), "--format=json,yaml [TAB]"),
-        snapbox::str![[r#"
---format
---help	Print help
-"#]]
+        snapbox::str!["--help	Print help"]
     );
     assert_data_eq!(
         complete!(spec_command(), "--fmt-kind=json,yaml [TAB]"),
-        snapbox::str![[r#"
---format
---help	Print help
-"#]]
+        snapbox::str!["--help	Print help"]
     );
     assert_data_eq!(
         complete!(spec_command(), "-fjson,yaml [TAB]"),
-        snapbox::str![[r#"
---format
---help	Print help
-"#]]
+        snapbox::str!["--help	Print help"]
     );
 
     // The conflicting long and alias candidates stay hidden under every
@@ -2136,10 +2109,7 @@ yaml
     // flags behind it (the same existing semantics as any conflict).
     assert_data_eq!(
         complete!(spec_command(), "-fjson,yaml -r[TAB]"),
-        snapbox::str![[r#"
--rf	--format
--rh	Print help
-"#]]
+        snapbox::str!["-rh	Print help"]
     );
 
     // Already selected value does not reappear; the editing segment filters on
@@ -2154,10 +2124,7 @@ yaml
     for input in ["--raw [TAB]", "--unformatted [TAB]", "-r [TAB]"] {
         assert_data_eq!(
             complete!(spec_command(), input),
-            snapbox::str![[r#"
---raw
---help	Print help
-"#]]
+            snapbox::str!["--help	Print help"]
         );
     }
 }
@@ -2294,7 +2261,8 @@ fn complete_first_word_respects_binary_name_setting() {
 
     // no_binary_name(true) without a program name: an option in first
     // position records state from the very first word, so `--format json`
-    // selects format and suppresses raw.
+    // selects format and suppresses raw; the consumed `format` is not offered
+    // again either.
     let mut cmd = spec_command().no_binary_name(true);
     let completions = complete_values(
         &mut cmd,
@@ -2303,7 +2271,7 @@ fn complete_first_word_respects_binary_name_setting() {
         None,
     );
     assert!(completions.contains(&"yaml".to_owned()));
-    assert!(completions.contains(&"--format".to_owned()));
+    assert!(!completions.contains(&"--format".to_owned()));
     assert!(!completions.contains(&"--raw".to_owned()));
 
     // Default without a program name: `--format` itself is skipped as the
@@ -2340,10 +2308,7 @@ fn suggest_spec_illegal_forms_error() {
     // `raw` is present, so `format` stays suppressed (it is not an error).
     assert_data_eq!(
         complete!(spec_command(), "--raw=x [TAB]"),
-        snapbox::str![[r#"
---raw
---help	Print help
-"#]]
+        snapbox::str!["--help	Print help"]
     );
 }
 
@@ -2451,7 +2416,6 @@ fn suggest_positional_long_allow_hyphen() {
         complete!(cmd, "--format --json --pos_a [TAB]"),
         snapbox::str![[r#"
 pos_b
---format
 --help	Print help
 "#]]
     );
@@ -2459,7 +2423,6 @@ pos_b
         complete!(cmd, "-F --json --pos_a [TAB]"),
         snapbox::str![[r#"
 pos_b
---format
 --help	Print help
 "#]]
     );
@@ -2495,7 +2458,6 @@ fn suggest_positional_short_allow_hyphen() {
         complete!(cmd, "--format --json -a [TAB]"),
         snapbox::str![[r#"
 pos_b
---format
 --help	Print help
 "#]]
     );
@@ -2503,7 +2465,6 @@ pos_b
         complete!(cmd, "-F --json -a [TAB]"),
         snapbox::str![[r#"
 pos_b
---format
 --help	Print help
 "#]]
     );
@@ -2633,17 +2594,13 @@ fn suggest_conflicting_args() {
 
     assert_data_eq!(
         complete!(command(), "--fast [TAB]"),
-        snapbox::str![[r#"
---fast
---help	Print help
-"#]],
+        snapbox::str!["--help	Print help"],
     );
 
     assert_data_eq!(
         complete!(command(), "--tag [TAB]"),
         snapbox::str![[r#"
 --safe
---tag
 --help	Print help
 "#]],
     );
@@ -2653,7 +2610,6 @@ fn suggest_conflicting_args() {
     assert_data_eq!(
         complete!(command(), "--safe [TAB]"),
         snapbox::str![[r#"
---safe
 --tag
 --file
 --help	Print help
@@ -2665,7 +2621,6 @@ fn suggest_conflicting_args() {
         complete!(command(), "--file [TAB]"),
         snapbox::str![[r#"
 --safe
---file
 --help	Print help
 "#]],
     );
@@ -2674,11 +2629,11 @@ fn suggest_conflicting_args() {
     // aliases; only disabled arguments lose theirs.
     assert_data_eq!(
         complete!(command(), "--fast --q[TAB]"),
-        snapbox::str!["--quick"]
+        snapbox::str![""]
     );
     assert_data_eq!(
         complete!(command(), "--fast --spe[TAB]"),
-        snapbox::str!["--speedy"]
+        snapbox::str![""]
     );
     assert_data_eq!(
         complete!(command(), "--fast --ta[TAB]"),
@@ -2688,11 +2643,7 @@ fn suggest_conflicting_args() {
     // A value given to an option is not mistaken for an option name.
     assert_data_eq!(
         complete!(command(), "--tag --safe [TAB]"),
-        snapbox::str![[r#"
---safe
---tag
---help	Print help
-"#]],
+        snapbox::str!["--help	Print help"],
     );
 }
 
@@ -2733,7 +2684,6 @@ fn suggest_conflicting_short_flags() {
         complete!(command(), "-t v1 [TAB]"),
         snapbox::str![[r#"
 --safe
---tag
 --help	Print help
 "#]],
     );
@@ -2743,7 +2693,6 @@ fn suggest_conflicting_short_flags() {
         complete!(command(), "-tv1 [TAB]"),
         snapbox::str![[r#"
 --safe
---tag
 --help	Print help
 "#]],
     );
@@ -2751,7 +2700,6 @@ fn suggest_conflicting_short_flags() {
         complete!(command(), "-t=v1 [TAB]"),
         snapbox::str![[r#"
 --safe
---tag
 --help	Print help
 "#]],
     );
@@ -2761,7 +2709,6 @@ fn suggest_conflicting_short_flags() {
         complete!(command(), "--tag v1 [TAB]"),
         snapbox::str![[r#"
 --safe
---tag
 --help	Print help
 "#]],
     );
@@ -2769,7 +2716,6 @@ fn suggest_conflicting_short_flags() {
         complete!(command(), "--tag=v1 [TAB]"),
         snapbox::str![[r#"
 --safe
---tag
 --help	Print help
 "#]],
     );
@@ -2777,15 +2723,11 @@ fn suggest_conflicting_short_flags() {
     // `fast` hides `safe`, `tag` and itself stays.
     assert_data_eq!(
         complete!(command(), "-f [TAB]"),
-        snapbox::str![[r#"
---fast
---help	Print help
-"#]],
+        snapbox::str!["--help	Print help"],
     );
     assert_data_eq!(
         complete!(command(), "-s [TAB]"),
         snapbox::str![[r#"
---safe
 --tag
 --help	Print help
 "#]],
@@ -2796,7 +2738,6 @@ fn suggest_conflicting_short_flags() {
         complete!(command(), "-t v1 -[TAB]"),
         snapbox::str![[r#"
 -s	--safe
--t	--tag
 -h	Print help
 "#]],
     );
@@ -2804,7 +2745,6 @@ fn suggest_conflicting_short_flags() {
         complete!(command(), "-t v1 -f[TAB]"),
         snapbox::str![[r#"
 -fs	--safe
--ft	--tag
 -fh	Print help
 "#]],
     );
@@ -2842,52 +2782,30 @@ v2
     // `fast`.
     assert_data_eq!(
         complete!(command(), "-st v1 [TAB]"),
-        snapbox::str![[r#"
---safe
---tag
---help	Print help
-"#]],
+        snapbox::str!["--help	Print help"],
     );
     assert_data_eq!(
         complete!(command(), "-stv1 [TAB]"),
-        snapbox::str![[r#"
---safe
---tag
---help	Print help
-"#]],
+        snapbox::str!["--help	Print help"],
     );
 
     // `f` before the value-taking `t` is recorded as well, so `safe` is hidden
     // by the time the attached value closes the word.
     assert_data_eq!(
         complete!(command(), "-ftv1 [TAB]"),
-        snapbox::str![[r#"
---fast
---tag
---help	Print help
-"#]],
+        snapbox::str!["--help	Print help"],
     );
 
-    // Invalid short strings keep the existing completion semantics: their
-    // recognized members are not guessed out of the cluster and therefore do
-    // not suppress anything.
-    assert_data_eq!(
-        complete!(command(), "-fx [TAB]"),
-        snapbox::str![[r#"
---fast
---safe
---tag
---help	Print help
-"#]],
+    // A closed cluster with an unknown member cannot be part of a valid
+    // command line; it is not split into known and unknown members, nor
+    // partially accepted, so completion reports the existing error.
+    assert_eq!(
+        complete_err(&mut command(), "-fx [TAB]"),
+        "no completion generated"
     );
-    assert_data_eq!(
-        complete!(command(), "-xt v1 [TAB]"),
-        snapbox::str![[r#"
---fast
---safe
---tag
---help	Print help
-"#]],
+    assert_eq!(
+        complete_err(&mut command(), "-xt v1 [TAB]"),
+        "no completion generated"
     );
 
     // After `--` only positionals are completed (none here); state parsed from
@@ -2915,7 +2833,8 @@ fn complete_no_binary_name_short_records_state() {
             )
     }
 
-    // With `no_binary_name`, the first word is parsed as an option.
+    // With `no_binary_name`, the first word is parsed as an option. Once `tag`
+    // and its value are consumed, `tag` is not offered a second time.
     let mut cmd = command();
     let completions =
         clap_complete::engine::complete(&mut cmd, vec!["-t".into(), "v1".into(), "".into()], 2, None)
@@ -2923,7 +2842,7 @@ fn complete_no_binary_name_short_records_state() {
             .into_iter()
             .map(|c| c.get_value().to_str().unwrap().to_owned())
             .collect::<Vec<_>>();
-    assert_eq!(completions, vec!["--tag", "--help"]);
+    assert_eq!(completions, vec!["--help"]);
 }
 
 #[test]
@@ -2945,10 +2864,7 @@ fn suggest_conflicts_declared_on_absent_arg() {
 
     assert_data_eq!(
         complete!(cmd, "--fast [TAB]"),
-        snapbox::str![[r#"
---fast
---help	Print help
-"#]],
+        snapbox::str!["--help	Print help"],
     );
 }
 
@@ -2967,10 +2883,7 @@ fn suggest_conflicts_with_all_and_groups() {
 
     assert_data_eq!(
         complete!(cmd, "--all [TAB]"),
-        snapbox::str![[r#"
---all
---help	Print help
-"#]],
+        snapbox::str!["--help	Print help"],
     );
 }
 
@@ -2996,20 +2909,14 @@ fn suggest_conflicts_unroll_group() {
     // `--a` and `--b`, in both directions.
     assert_data_eq!(
         complete!(command(), "--other [TAB]"),
-        snapbox::str![[r#"
---other
---help	Print help
-"#]],
+        snapbox::str!["--help	Print help"],
     );
 
     // `--a` hides `--other` through the group and hides `--b` because the
     // group is not `multiple`.
     assert_data_eq!(
         complete!(command(), "--a [TAB]"),
-        snapbox::str![[r#"
---a
---help	Print help
-"#]],
+        snapbox::str!["--help	Print help"],
     );
 
     // A multiple(true) group lets its members coexist.
@@ -3020,7 +2927,6 @@ fn suggest_conflicts_unroll_group() {
     assert_data_eq!(
         complete!(cmd, "--a [TAB]"),
         snapbox::str![[r#"
---a
 --b
 --help	Print help
 "#]],
@@ -3046,7 +2952,6 @@ fn suggest_keeps_overrides_with_candidates() {
     assert_data_eq!(
         complete!(cmd, "--color [TAB]"),
         snapbox::str![[r#"
---color
 --mono
 --help	Print help
 "#]],
@@ -3118,10 +3023,7 @@ fn suggest_long_equals_visible_alias_values() {
     // canonical spelling: `tag` is present and hides `fast`.
     assert_data_eq!(
         complete!(cmd, "--label=red [TAB]"),
-        snapbox::str![[r#"
---tag
---help	Print help
-"#]]
+        snapbox::str!["--help	Print help"]
     );
 
     // Hidden aliases stay undiscoverable, including with an attached value.
@@ -3146,6 +3048,8 @@ fn complete_no_binary_name_keeps_first_arg() {
             )
     }
 
+    // The consumed `fast` is not offered again; `safe` is hidden by the
+    // conflict, leaving only help.
     let mut cmd = command();
     let completions =
         clap_complete::engine::complete(&mut cmd, vec!["--fast".into(), "".into()], 1, None)
@@ -3153,7 +3057,7 @@ fn complete_no_binary_name_keeps_first_arg() {
             .into_iter()
             .map(|c| c.get_value().to_str().unwrap().to_owned())
             .collect::<Vec<_>>();
-    assert_eq!(completions, vec!["--fast", "--help"]);
+    assert_eq!(completions, vec!["--help"]);
 
     // Without `no_binary_name`, `args[0]` is the binary name and skipped, so
     // `--fast` is not part of the completed command line.
@@ -3214,7 +3118,6 @@ sub
 help	Print this message or the help of the given subcommand(s)
 pos-a
 pos-b
---tag
 --help	Print help
 "#]]
     );
@@ -3258,7 +3161,6 @@ fn suggest_long_equals_multi_values() {
         complete!(cmd, "--nums=one [TAB]"),
         snapbox::str![[r#"
 pos-a
---nums
 --help	Print help
 "#]]
     );
@@ -3288,10 +3190,7 @@ fn suggest_long_equals_failure_semantics() {
     // `fast`, so the conflicting `tag` stays suppressed.
     assert_data_eq!(
         complete!(cmd, "--fast=x [TAB]"),
-        snapbox::str![[r#"
---fast
---help	Print help
-"#]]
+        snapbox::str!["--help	Print help"]
     );
 
     // The word being edited is not part of the conflict set yet, but
@@ -3328,14 +3227,14 @@ fn complete_no_binary_name_equals_records_state() {
         );
 
     // With `no_binary_name`, a first word of `--tag=v1` records `tag` as
-    // present and hides the conflicting `fast`.
+    // present, hides the conflicting `fast` and does not offer `tag` again.
     let completions =
         clap_complete::engine::complete(&mut cmd, vec!["--tag=v1".into(), "".into()], 1, None)
             .unwrap()
             .into_iter()
             .map(|c| c.get_value().to_str().unwrap().to_owned())
             .collect::<Vec<_>>();
-    assert_eq!(completions, vec!["--tag", "--help"]);
+    assert_eq!(completions, vec!["--help"]);
 }
 
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
@@ -3665,3 +3564,337 @@ reset
     );
 }
 
+
+/// Root `tool` command for the dynamic-completion short-cluster tests.
+///
+/// `-v` is a value-less switch; `-n`/`--number` takes exactly one of
+/// `-3`,`-2`,`-1`,`0`,`1`,`2`,`3`; `--mode` takes `fast`/`safe`; the `path`
+/// positional offers directories. Shorts may cluster, but the value-taking
+/// `-n` must be the last member, with its value attached or in the next word.
+fn cluster_tool_command() -> Command {
+    Command::new("tool")
+        .arg(
+            clap::Arg::new("verbose")
+                .short('v')
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("number")
+                .short('n')
+                .long("number")
+                .value_parser(["-3", "-2", "-1", "0", "1", "2", "3"]),
+        )
+        .arg(
+            clap::Arg::new("mode")
+                .long("mode")
+                .value_parser(["fast", "safe"]),
+        )
+        .arg(clap::Arg::new("path").value_hint(clap::ValueHint::DirPath))
+}
+
+fn cluster_tool_tempdir() -> snapbox::dir::DirRoot {
+    let testdir = snapbox::dir::DirRoot::mutable_temp().unwrap();
+    let path = testdir.path().unwrap();
+    fs::create_dir_all(path.join("a_dir/nested")).unwrap();
+    fs::create_dir_all(path.join("b_dir")).unwrap();
+    fs::write(path.join("a_file"), "").unwrap();
+    testdir
+}
+
+#[test]
+fn cluster_tool_empty_word_lists_unconsumed_options_shorts_and_path() {
+    let testdir = cluster_tool_tempdir();
+    let path = testdir.path().unwrap();
+
+    // The empty word offers the positional's directory entries, the long
+    // options and the short names, with the established tag/order and
+    // de-duplication.
+    assert_data_eq!(
+        complete!(cluster_tool_command(), " [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+-v
+--number
+--mode
+--help	Print help
+"#]]
+    );
+
+    // A lone `-` lists short names (and the directory positional), never the
+    // long options.
+    assert_data_eq!(
+        complete!(cluster_tool_command(), "-[TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+-v
+-n	--number
+--mode
+-h	Print help
+"#]]
+    );
+}
+
+#[test]
+fn cluster_tool_consumed_switch_is_not_offered_again() {
+    // After `-v`, the empty word still offers every unconsumed option but no
+    // longer the consumed switch (long or short).
+    assert_data_eq!(
+        complete!(cluster_tool_command(), "-v [TAB]"),
+        snapbox::str![[r#"
+--number
+--mode
+--help	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(cluster_tool_command(), "-v -[TAB]"),
+        snapbox::str![[r#"
+-n	--number
+--mode
+-h	Print help
+"#]]
+    );
+
+    // Appending to the `-v` cluster offers only flags not yet written.
+    assert_data_eq!(
+        complete!(cluster_tool_command(), "-v[TAB]"),
+        snapbox::str![[r#"
+-vn	--number
+-vh	Print help
+"#]]
+    );
+}
+
+#[test]
+fn cluster_tool_number_value_states() {
+    // `-n`, `-vn` and `-n`/`-vn` with a dangling `-` all enter the number
+    // value state. An empty prefix offers all seven integers; the `-` prefix
+    // only the three negative ones.
+    let seven = snapbox::str![[r#"
+-3
+-2
+-1
+0
+1
+2
+3
+"#]];
+    for input in ["-n [TAB]", "-vn [TAB]"] {
+        assert_data_eq!(complete!(cluster_tool_command(), input), seven.clone());
+    }
+    let seven_attached = snapbox::str![[r#"
+-n-3
+-n-2
+-n-1
+-n0
+-n1
+-n2
+-n3
+"#]];
+    assert_data_eq!(complete!(cluster_tool_command(), "-n[TAB]"), seven_attached);
+    assert_data_eq!(
+        complete!(cluster_tool_command(), "-n-[TAB]"),
+        snapbox::str![[r#"
+-n-3
+-n-2
+-n-1
+"#]]
+    );
+    assert_data_eq!(
+        complete!(cluster_tool_command(), "-vn-[TAB]"),
+        snapbox::str![[r#"
+-vn-3
+-vn-2
+-vn-1
+"#]]
+    );
+
+    // A non-matching prefix is an empty success while the value is edited,
+    // not an error.
+    assert_data_eq!(complete!(cluster_tool_command(), "-n9[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(cluster_tool_command(), "-n30[TAB]"), snapbox::str![""]);
+}
+
+#[test]
+fn cluster_tool_number_spellings_reach_the_same_state() {
+    let testdir = cluster_tool_tempdir();
+    let path = testdir.path().unwrap();
+
+    // Every spelling of the completed number reaches the same "number done"
+    // state: `number` is offered no more and no `mode` value leaks in. The
+    // spellings that do not also carry `-v` keep the switch; `-vn-3`
+    // consumes it as part of the same cluster.
+    let done = snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+-v
+--mode
+--help	Print help
+"#]];
+    for input in ["-n -3 [TAB]", "-n3 [TAB]", "--number=-3 [TAB]", "--number -3 [TAB]"] {
+        assert_data_eq!(
+            complete!(cluster_tool_command(), input, current_dir = Some(path)),
+            done.clone()
+        );
+    }
+    assert_data_eq!(
+        complete!(cluster_tool_command(), "-vn-3 [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+--mode
+--help	Print help
+"#]]
+    );
+
+    // Repeated raw calls on the same spelling are stable and stateless, and
+    // the canonical long name, the `=` and the separate-word form return
+    // identical vectors.
+    let spellings: Vec<Vec<std::ffi::OsString>> = vec![
+        vec!["tool".into(), "-n".into(), "-3".into(), "".into()],
+        vec!["tool".into(), "--number=-3".into(), "".into()],
+        vec!["tool".into(), "--number".into(), "-3".into(), "".into()],
+    ];
+    let mut results = Vec::new();
+    for args in &spellings {
+        let values = clap_complete::engine::complete(
+            &mut cluster_tool_command(),
+            args.clone(),
+            args.len() - 1,
+            Some(path),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|c| c.get_value().to_os_string())
+        .collect::<Vec<_>>();
+        results.push(values);
+    }
+    assert!(results.windows(2).all(|w| w[0] == w[1]));
+
+    // The clustered spelling differs from the long ones only by the `-v` it
+    // carried in the same word; the number/mode entries are identical.
+    let clustered = clap_complete::engine::complete(
+        &mut cluster_tool_command(),
+        vec!["tool".into(), "-vn-3".into(), "".into()],
+        2,
+        Some(path),
+    )
+    .unwrap()
+    .into_iter()
+    .map(|c| c.get_value().to_os_string())
+    .collect::<Vec<_>>();
+    assert_eq!(clustered, results[0].iter().filter(|v| *v != "-v").cloned().collect::<Vec<_>>());
+}
+
+#[test]
+fn cluster_tool_letters_glued_onto_a_value_are_illegal() {
+    // Editing the mixed word: no split into value plus cluster, no partial
+    // success.
+    for input in ["-n3v[TAB]", "-n-3v[TAB]", "-vn3v[TAB]", "-vn-3v[TAB]"] {
+        assert_eq!(
+            complete_err(&mut cluster_tool_command(), input),
+            "no completion generated"
+        );
+    }
+
+    // The same words already closed make the whole line uncompletable.
+    for input in ["-n3v [TAB]", "-n-3v [TAB]", "-vn3v [TAB]", "-vn-3v [TAB]"] {
+        assert_eq!(
+            complete_err(&mut cluster_tool_command(), input),
+            "no completion generated"
+        );
+    }
+}
+
+#[test]
+fn cluster_tool_illegal_forms_error() {
+    // Unknown short letter, repeated switch, empty/equals-only cluster,
+    // missing value, illegal closed number and a cursor past the word
+    // sequence all report the existing error rather than guessing. Closed
+    // words and structurally malformed clusters are never split or partially
+    // accepted.
+    for input in [
+        "-x [TAB]",
+        "-vv [TAB]",
+        "-v -v [TAB]",
+        "-vn-3 -v [TAB]",
+        "-= [TAB]",
+        "-v= [TAB]",
+        "-n9 [TAB]",
+        "--mode=fast -n9 [TAB]",
+        "-n --mode fast [TAB]",
+        "--number 9 [TAB]",
+        "--mode=x [TAB]",
+        // The same structural failures at the cursor word.
+        "-x[TAB]",
+        "-vx[TAB]",
+        "-vv[TAB]",
+        "-v=[TAB]",
+        "-=[TAB]",
+    ] {
+        assert_eq!(
+            complete_err(&mut cluster_tool_command(), input),
+            "no completion generated",
+            "expected error for {input}"
+        );
+    }
+
+    // An unknown prefix of the value being edited (an unmatched filter) is an
+    // empty success, like every other fixed-value completion; only a closed
+    // illegal number and a letter glued onto a complete value are errors.
+    assert_data_eq!(complete!(cluster_tool_command(), "-n9[TAB]"), snapbox::str![""]);
+    assert_data_eq!(complete!(cluster_tool_command(), "--mode=z[TAB]"), snapbox::str![""]);
+
+    // A bare value-taking option with no following word is missing its value.
+    let err = clap_complete::engine::complete(
+        &mut cluster_tool_command(),
+        vec!["tool".into(), "-n".into()],
+        2,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), "no completion generated");
+
+    // An arg index past the word sequence cannot be completed either.
+    let err = clap_complete::engine::complete(
+        &mut cluster_tool_command(),
+        vec!["tool".into(), "-v".into()],
+        5,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), "no completion generated");
+}
+
+#[test]
+fn cluster_tool_escape_only_returns_path_entries() {
+    let testdir = cluster_tool_tempdir();
+    let path = testdir.path().unwrap();
+
+    // After a standalone `--`, options never return: only the path
+    // positional's directory candidates, honoring prefix, order and dedup.
+    assert_data_eq!(
+        complete!(cluster_tool_command(), "-- [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+"#]]
+    );
+    assert_data_eq!(
+        complete!(cluster_tool_command(), "-v -- [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+"#]]
+    );
+    assert_data_eq!(
+        complete!(cluster_tool_command(), "-- a[TAB]", current_dir = Some(path)),
+        snapbox::str!["a_dir/"]
+    );
+    assert_data_eq!(complete!(cluster_tool_command(), "-- -v[TAB]"), snapbox::str![""]);
+}
