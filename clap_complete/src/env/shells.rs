@@ -2,6 +2,23 @@ use std::ffi::OsString;
 use std::str::FromStr;
 
 use super::EnvCompleter;
+use crate::engine::CompletionCandidate;
+
+/// The text the shell should replace the current token with: the bare
+/// candidate value, plus its attached-option prefix (`--option=` or `-f`) when
+/// the completion belongs to an inline option value.
+fn completion_text(candidate: &CompletionCandidate) -> std::borrow::Cow<'_, str> {
+    let value = candidate.get_value().to_string_lossy();
+    let prefix = candidate.get_token_prefix().to_string_lossy();
+    if prefix.is_empty() {
+        value
+    } else {
+        let mut text = String::with_capacity(prefix.len() + value.len());
+        text.push_str(&prefix);
+        text.push_str(&value);
+        text.into()
+    }
+}
 
 /// Bash completion adapter
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -94,7 +111,7 @@ fi
             if i != 0 {
                 write!(buf, "{}", ifs.as_deref().unwrap_or("\n"))?;
             }
-            write!(buf, "{}", candidate.get_value().to_string_lossy())?;
+            write!(buf, "{}", completion_text(candidate))?;
         }
         Ok(())
     }
@@ -188,7 +205,7 @@ set edit:completion:arg-completer[BIN] = { |@words|
             if i != 0 {
                 write!(buf, "{}", ifs.as_deref().unwrap_or("\n"))?;
             }
-            write!(buf, "{}", candidate.get_value().to_string_lossy())?;
+            write!(buf, "{}", completion_text(candidate))?;
         }
         Ok(())
     }
@@ -232,7 +249,7 @@ impl EnvCompleter for Fish {
         let completions = crate::engine::complete(cmd, args, index, current_dir)?;
 
         for candidate in completions {
-            write!(buf, "{}", candidate.get_value().to_string_lossy())?;
+            write!(buf, "{}", completion_text(&candidate))?;
             if let Some(help) = candidate.get_help() {
                 write!(
                     buf,
@@ -382,7 +399,7 @@ Register-ArgumentCompleter -Native -CommandName {bin} -ScriptBlock {{
         let completions = crate::engine::complete(cmd, args, index, current_dir)?;
 
         for candidate in completions {
-            write!(buf, "{}", candidate.get_value().to_string_lossy())?;
+            write!(buf, "{}", completion_text(&candidate))?;
             if let Some(help) = candidate.get_help() {
                 write!(
                     buf,
@@ -488,11 +505,7 @@ compdef _clap_dynamic_completer_NAME BIN"#
             if i != 0 {
                 write!(buf, "{}", ifs.as_deref().unwrap_or("\n"))?;
             }
-            write!(
-                buf,
-                "{}",
-                Self::escape_value(&candidate.get_value().to_string_lossy())
-            )?;
+            write!(buf, "{}", Self::escape_value(&completion_text(candidate)))?;
             if let Some(help) = candidate.get_help() {
                 write!(
                     buf,

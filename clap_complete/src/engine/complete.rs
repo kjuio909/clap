@@ -306,22 +306,29 @@ fn complete_arg(
 
     // A token under the cursor may itself repeat an option that already took a
     // value; for a non-repeatable option this is invalid and yields nothing.
-    if !is_escaped && matches!(state, ParseState::ValueDone | ParseState::Pos(..)) {
-        if let Some(opt) = cursor_option(cmd, arg) {
-            if opt.get_num_args().expect("built").takes_values()
-                && !can_repeat(opt)
-                && seen_options.contains(&opt.get_id().to_string())
-            {
-                debug!(
-                    "complete: repeated non-repeatable opt={:?} at cursor",
-                    opt.get_id()
-                );
-                return Ok(Vec::new());
-            }
-        }
+    if !is_escaped
+        && matches!(state, ParseState::ValueDone | ParseState::Pos(..))
+        && is_repeated_cursor_option(cmd, arg, seen_options)
+    {
+        debug!("complete: repeated non-repeatable option at cursor");
+        return Ok(Vec::new());
     }
 
     let mut completions = Vec::<CompletionCandidate>::new();
+
+    // A cursor token with an attached option value (`--option=value`,
+    // `-f=value` or `-fvalue`) is wholly owned by that option: it cannot name
+    // a subcommand, positional, or another option, so those candidate sources
+    // must not pollute it. The candidate text itself stays bare (the
+    // `--option=` prefix is recorded on the candidate for the shell adapters),
+    // matching the independent `--option value` spelling.
+    if !is_escaped
+        && matches!(state, ParseState::ValueDone | ParseState::Pos(..))
+        && attached_option(cmd, arg).is_some()
+    {
+        completions.extend(complete_option(arg, cmd, current_dir));
+        return finish_completions(completions);
+    }
 
     match state {
         ParseState::ValueDone => {
@@ -376,6 +383,7 @@ fn complete_arg(
                 count.saturating_sub(1),
             ));
             let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
+            let max = opt.get_num_args().map(|r| r.max_values()).unwrap_or(0);
             // An option whose value is optional (a minimum of zero values)
             // always serves its own value at the first value slot; falling back
             // to flags and positionals here would let `--color <TAB>` mix
@@ -383,19 +391,42 @@ fn complete_arg(
             // least one value keep offering the alternatives once their
             // required values have been supplied.
             if count > min && min > 0 {
-                // Also complete this raw_arg as a positional argument, flags, options and subcommand.
-                completions.extend(complete_arg(
-                    arg,
-                    cmd,
-                    current_dir,
-                    pos_index,
-                    is_escaped,
-                    ParseState::ValueDone,
-                    seen_options,
-                )?);
+                if max == usize::MAX {
+                    // An option taking an unbounded number of values never
+                    // reaches a finished value slot. A plain token keeps
+                    // completing only that option's values (`--tag red <TAB>`
+                    // must not list flags or positionals); a token that looks
+                    // like an option lets the user start another option in the
+                    // middle of the list, and only option candidates apply.
+                    if looks_like_option(arg) {
+                        if is_repeated_cursor_option(cmd, arg, seen_options) {
+                            return Ok(Vec::new());
+                        }
+                        completions.extend(complete_option(arg, cmd, current_dir));
+                    }
+                } else {
+                    // Also complete this raw_arg as a positional argument, flags, options and subcommand.
+                    completions.extend(complete_arg(
+                        arg,
+                        cmd,
+                        current_dir,
+                        pos_index,
+                        is_escaped,
+                        ParseState::ValueDone,
+                        seen_options,
+                    )?);
+                }
             }
         }
     }
+    finish_completions(completions)
+}
+
+/// Apply hidden filtering, de-duplication, and tag/order sorting to collected
+/// candidates.
+fn finish_completions(
+    mut completions: Vec<CompletionCandidate>,
+) -> Result<Vec<CompletionCandidate>, std::io::Error> {
     if completions.iter().any(|a| !a.is_hide_set()) {
         completions.retain(|a| !a.is_hide_set());
     }
@@ -471,11 +502,14 @@ fn complete_option(
     } else if let Some((flag, value)) = arg.to_long() {
         if let Ok(flag) = flag {
             if let Some(value) = value {
-                if let Some(arg) = cmd.get_arguments().find(|a| a.get_long() == Some(flag)) {
+                if let Some(arg) = cmd.get_arguments().find(|a| {
+                    a.get_long_and_visible_aliases()
+                        .is_some_and(|longs| longs.into_iter().any(|long| long == flag))
+                }) {
                     completions.extend(
                         complete_arg_value(value.to_str().ok_or(value), arg, current_dir, 0)
                             .into_iter()
-                            .map(|comp| comp.add_prefix(format!("--{flag}="))),
+                            .map(|comp| comp.token_prefix(format!("--{flag}="))),
                     );
                 }
             } else {
@@ -512,7 +546,7 @@ fn complete_option(
                         .into_iter()
                         .map(|comp| {
                             let sep = if has_equal { "=" } else { "" };
-                            comp.add_prefix(format!("-{leading_flags}{sep}"))
+                            comp.token_prefix(format!("-{leading_flags}{sep}"))
                         }),
                 );
             } else {
@@ -936,6 +970,59 @@ fn can_repeat(arg: &clap::Arg) -> bool {
         arg.get_action(),
         clap::ArgAction::Append | clap::ArgAction::Count
     )
+}
+
+/// Resolve the option whose value is attached inline in the cursor token
+/// (`--option=value`, `-f=value`, or `-fvalue`), if any.
+///
+/// A value-taking short flag named without an inline value (`-f`) is not
+/// considered attached.
+fn attached_option<'c>(
+    cmd: &'c clap::Command,
+    arg: &clap_lex::ParsedArg<'_>,
+) -> Option<&'c clap::Arg> {
+    if let Some((Ok(flag), Some(_))) = arg.to_long() {
+        return cmd.get_arguments().find(|a| {
+            a.get_num_args().expect("built").takes_values()
+                && a.get_long_and_visible_aliases()
+                    .is_some_and(|longs| longs.into_iter().any(|long| long == flag))
+        });
+    }
+
+    if let Some(short) = arg.to_short() {
+        if !short.is_negative_number() {
+            let (_, opt, mut remainder) = parse_shortflags(cmd, short);
+            if let Some(opt) = opt {
+                // Consume an optional `=` separator before checking whether an
+                // inline value follows the flag; an explicit `-f=` carries an
+                // empty attached value and is still attached.
+                let mut peek = remainder.clone();
+                let has_equal = peek.next_flag() == Some(Ok('='));
+                if has_equal {
+                    remainder.next_flag();
+                }
+                if has_equal || remainder.next_value_os().is_some() {
+                    return Some(opt);
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Whether the cursor token repeats a non-repeatable option that has already
+/// taken a value on this command line.
+fn is_repeated_cursor_option(
+    cmd: &clap::Command,
+    arg: &clap_lex::ParsedArg<'_>,
+    seen_options: &std::collections::HashSet<String>,
+) -> bool {
+    cursor_option(cmd, arg).is_some_and(|opt| {
+        opt.get_num_args().expect("built").takes_values()
+            && !can_repeat(opt)
+            && seen_options.contains(&opt.get_id().to_string())
+    })
 }
 
 /// Resolve the option named by a cursor token, if it is a recognizable long or

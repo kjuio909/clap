@@ -4,14 +4,50 @@ use std::ffi::OsString;
 use clap::builder::StyledStr;
 
 /// A shell-agnostic completion candidate
-#[derive(Default, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Default, Debug)]
 pub struct CompletionCandidate {
     value: OsString,
+    /// Literal text of the token prefix the value is attached to
+    /// (`--option=` or `-f`), kept separate from [`value`] so that the
+    /// candidate text matches the independent (`--option value`) spelling.
+    /// Shell adapters re-attach it when emitting the replacement text.
+    token_prefix: OsString,
     help: Option<StyledStr>,
     id: Option<String>,
     tag: Option<StyledStr>,
     display_order: Option<usize>,
     hidden: bool,
+}
+
+impl PartialEq for CompletionCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+            && self.help == other.help
+            && self.id == other.id
+            && self.tag == other.tag
+            && self.display_order == other.display_order
+            && self.hidden == other.hidden
+    }
+}
+
+impl Eq for CompletionCandidate {}
+
+impl PartialOrd for CompletionCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CompletionCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.value
+            .cmp(&other.value)
+            .then_with(|| self.help.cmp(&other.help))
+            .then_with(|| self.id.cmp(&other.id))
+            .then_with(|| self.tag.cmp(&other.tag))
+            .then_with(|| self.display_order.cmp(&other.display_order))
+            .then_with(|| self.hidden.cmp(&other.hidden))
+    }
 }
 
 impl CompletionCandidate {
@@ -71,6 +107,19 @@ impl CompletionCandidate {
         self.value = value;
         self
     }
+
+    /// Record the already-typed token text (`--option=` or `-f`) that the
+    /// candidate value completes within.
+    ///
+    /// Unlike [`add_prefix`], this leaves [`get_value`](Self::get_value) bare,
+    /// so attached (`--option=val`) and independent (`--option val`)
+    /// completions carry identical candidate text. Shell adapters that replace
+    /// the whole token re-attach this via
+    /// [`get_token_prefix`](Self::get_token_prefix).
+    pub(crate) fn token_prefix(mut self, prefix: impl Into<OsString>) -> Self {
+        self.token_prefix = prefix.into();
+        self
+    }
 }
 
 /// Reflection API
@@ -78,6 +127,16 @@ impl CompletionCandidate {
     /// Get the literal value being proposed for completion
     pub fn get_value(&self) -> &OsStr {
         &self.value
+    }
+
+    /// Get the already-typed token text (`--option=` or `-f`) the value is
+    /// attached to, if completing an attached option value.
+    ///
+    /// [`get_value`](Self::get_value) is always bare. Shell adapters that
+    /// replace the token under the cursor should prepend this prefix when
+    /// emitting the completion.
+    pub(crate) fn get_token_prefix(&self) -> &OsStr {
+        &self.token_prefix
     }
 
     /// Get the help message of the completion candidate
