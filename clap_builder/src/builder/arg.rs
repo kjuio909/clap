@@ -4186,6 +4186,12 @@ impl Arg {
         self.conflicts.iter()
     }
 
+    /// Get the arguments and groups this argument overrides
+    #[inline]
+    pub fn get_overrides_with(&self) -> impl Iterator<Item = &Id> + Clone {
+        self.overrides.iter()
+    }
+
     /// Get the help specified for this argument, if any
     #[inline]
     pub fn get_help(&self) -> Option<&StyledStr> {

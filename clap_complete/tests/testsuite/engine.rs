@@ -2868,26 +2868,17 @@ v2
 "#]],
     );
 
-    // Invalid short strings keep the existing completion semantics: their
-    // recognized members are not guessed out of the cluster and therefore do
-    // not suppress anything.
-    assert_data_eq!(
-        complete!(command(), "-fx [TAB]"),
-        snapbox::str![[r#"
---fast
---safe
---tag
---help	Print help
-"#]],
+    // Once a word carrying an unknown short member is closed, clap rejects the
+    // line; completion reports an error rather than guessing the recognized
+    // members out of the cluster. Reaching a value-taking member through a
+    // leading unknown member is illegal for the same reason.
+    assert_eq!(
+        complete_err(&mut command(), "-fx [TAB]"),
+        "no completion generated"
     );
-    assert_data_eq!(
-        complete!(command(), "-xt v1 [TAB]"),
-        snapbox::str![[r#"
---fast
---safe
---tag
---help	Print help
-"#]],
+    assert_eq!(
+        complete_err(&mut command(), "-xt v1 [TAB]"),
+        "no completion generated"
     );
 
     // After `--` only positionals are completed (none here); state parsed from
@@ -3664,4 +3655,448 @@ reset
 "#]]
     );
 }
+
+/// Build the command from the short-cluster/value-state spec:
+///
+/// - `-v`/`--verbose` is a valueless switch
+/// - `-n`/`--number` accepts exactly the seven integers `-3..=3`
+/// - `--mode` accepts only `fast`/`safe`
+/// - the `path` positional completes directories
+///
+/// Shorts may cluster, but the value-taking `-n` is the last cluster member
+/// and its value may be attached or written as the next word; long names
+/// support both `=` and a separate value word.
+fn cluster_command() -> Command {
+    Command::new("tool")
+        .arg(
+            clap::Arg::new("verbose")
+                .short('v')
+                .long("verbose")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("number")
+                .short('n')
+                .long("number")
+                .value_parser(["-3", "-2", "-1", "0", "1", "2", "3"]),
+        )
+        .arg(
+            clap::Arg::new("mode")
+                .long("mode")
+                .value_parser(["fast", "safe"]),
+        )
+        .arg(clap::Arg::new("path").value_hint(clap::ValueHint::DirPath))
+}
+
+fn cluster_tempdir() -> snapbox::dir::DirRoot {
+    let testdir = snapbox::dir::DirRoot::mutable_temp().unwrap();
+    let path = testdir.path().unwrap();
+    fs::create_dir_all(path.join("a_dir/nested")).unwrap();
+    fs::create_dir_all(path.join("b_dir")).unwrap();
+    fs::write(path.join("a_file"), "").unwrap();
+    testdir
+}
+
+#[test]
+fn cluster_empty_word_lists_options_shorts_and_positional() {
+    let testdir = cluster_tempdir();
+    let path = testdir.path().unwrap();
+
+    // An empty word offers the long names and the positional's directories;
+    // shorts that share an id with a long collapse into the long, keeping the
+    // existing sort and de-duplication.
+    assert_data_eq!(
+        complete!(cluster_command(), " [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+--verbose
+--number
+--mode
+--help	Print help
+"#]]
+    );
+
+    // A dash word surfaces the short spellings while keeping the long-only
+    // `--mode`; help text is the option's long name.
+    assert_data_eq!(
+        complete!(cluster_command(), "-[TAB]"),
+        snapbox::str![[r#"
+-v	--verbose
+-n	--number
+--mode
+-h	Print help
+"#]]
+    );
+}
+
+#[test]
+fn cluster_consumed_switch_keeps_unconsumed_shorts() {
+    // Consuming `-v` does not exhaust the short names: the following dash word
+    // still offers every short and the long-only mode.
+    assert_data_eq!(
+        complete!(cluster_command(), "-v -[TAB]"),
+        snapbox::str![[r#"
+-v	--verbose
+-n	--number
+--mode
+-h	Print help
+"#]]
+    );
+}
+
+#[test]
+fn cluster_number_value_state_offers_seven_integers() {
+    // `-vn`, a bare `-n` waiting for the next word and an attached `-n-` all
+    // enter the number value position; an empty value prefix returns all seven
+    // allowed integers.
+    let all = snapbox::str![[r#"
+-3
+-2
+-1
+0
+1
+2
+3
+"#]];
+    for input in ["-vn [TAB]", "-n [TAB]"] {
+        assert_data_eq!(complete!(cluster_command(), input), all.clone());
+    }
+
+    // While attached, the candidate keeps the caller's cluster spelling.
+    assert_data_eq!(
+        complete!(cluster_command(), "-vn[TAB]"),
+        snapbox::str![[r#"
+-vn-3
+-vn-2
+-vn-1
+-vn0
+-vn1
+-vn2
+-vn3
+"#]]
+    );
+
+    // The `-` prefix narrows the set to the three negative integers, across
+    // the short attached, `=` and long spellings.
+    assert_data_eq!(
+        complete!(cluster_command(), "-n-[TAB]"),
+        snapbox::str![[r#"
+-n-3
+-n-2
+-n-1
+"#]]
+    );
+    assert_data_eq!(
+        complete!(cluster_command(), "-n=-[TAB]"),
+        snapbox::str![[r#"
+-n=-3
+-n=-2
+-n=-1
+"#]]
+    );
+    assert_data_eq!(
+        complete!(cluster_command(), "--number=-[TAB]"),
+        snapbox::str![[r#"
+--number=-3
+--number=-2
+--number=-1
+"#]]
+    );
+}
+
+#[test]
+fn cluster_equivalent_spellings_establish_same_state() {
+    // Attached, `=`, separate and clustered spellings of the same `-3` value
+    // all finish the occurrence identically; the next empty word offers only
+    // the ordinary options (plus the positional when a directory is given),
+    // never the number values or the mode values again.
+    let after = snapbox::str![[r#"
+--verbose
+--number
+--mode
+--help	Print help
+"#]];
+    for input in [
+        "-vn-3 [TAB]",
+        "-n-3 [TAB]",
+        "-n -3 [TAB]",
+        "-n=-3 [TAB]",
+        "--number=-3 [TAB]",
+        "--number -3 [TAB]",
+    ] {
+        assert_data_eq!(complete!(cluster_command(), input), after.clone());
+    }
+
+    // The same state reached with a value prefix still in progress.
+    assert_data_eq!(
+        complete!(cluster_command(), "-n-3 -[TAB]"),
+        snapbox::str![[r#"
+-v	--verbose
+-n	--number
+--mode
+-h	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(cluster_command(), "-n -3 -[TAB]"),
+        snapbox::str![[r#"
+-v	--verbose
+-n	--number
+--mode
+-h	Print help
+"#]]
+    );
+}
+
+#[test]
+fn cluster_after_value_only_ordinary_candidates() {
+    // Once the number is closed, asking again offers switches, the options and
+    // the positional, but not `number`'s integers and never `mode`'s values.
+    let testdir = cluster_tempdir();
+    let path = testdir.path().unwrap();
+    assert_data_eq!(
+        complete!(cluster_command(), "-n-3 [TAB]", current_dir = Some(path)),
+        snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+--verbose
+--number
+--mode
+--help	Print help
+"#]]
+    );
+    // The mode value candidates do not leak while mode itself is not pending.
+    assert_data_eq!(complete!(cluster_command(), "-n-3 f[TAB]"), snapbox::str![""]);
+}
+
+#[test]
+fn cluster_glued_letters_after_value_are_illegal() {
+    // Letters glued behind an attached value make the word an illegal mix of a
+    // value and a trailing cluster: the engine neither splits it nor partially
+    // succeeds once the word is closed.
+    for input in ["-n3v [TAB]", "-n-3v [TAB]", "-vn3v [TAB]", "-n=3v [TAB]"] {
+        assert_eq!(
+            complete_err(&mut cluster_command(), input),
+            "no completion generated",
+            "input {input}"
+        );
+    }
+
+    // The same text while still being edited offers no candidate rather than
+    // an error; it is never treated as a cluster either.
+    for input in ["-n3v[TAB]", "-n-3v[TAB]", "-vn3v[TAB]"] {
+        assert_data_eq!(complete!(cluster_command(), input), snapbox::str![""]);
+    }
+}
+
+#[test]
+fn cluster_escape_restricts_to_path_and_directories() {
+    let testdir = cluster_tempdir();
+    let path = testdir.path().unwrap();
+
+    // After a standalone `--` only the positional and its directories remain,
+    // including when option state was established beforehand.
+    for input in ["-- [TAB]", "-v -- [TAB]", "-n-3 -- [TAB]", "--mode fast -- [TAB]"] {
+        assert_data_eq!(
+            complete!(cluster_command(), input, current_dir = Some(path)),
+            snapbox::str![[r#"
+.
+a_dir/
+b_dir/
+"#]]
+        );
+    }
+
+    // Prefix, entered directory and directory filtering keep the existing path
+    // rules, and only directories pass the `DirPath` filter.
+    assert_data_eq!(
+        complete!(cluster_command(), "-- a[TAB]", current_dir = Some(path)),
+        snapbox::str!["a_dir/"]
+    );
+    assert_data_eq!(
+        complete!(cluster_command(), "-- a_dir/[TAB]", current_dir = Some(path)),
+        snapbox::str!["a_dir/nested/"]
+    );
+
+    // Options never come back after `--`.
+    assert_data_eq!(
+        complete!(cluster_command(), "-n-3 -- -[TAB]", current_dir = Some(path)),
+        snapbox::str![""]
+    );
+    assert_data_eq!(
+        complete!(cluster_command(), "-- --m[TAB]", current_dir = Some(path)),
+        snapbox::str![""]
+    );
+}
+
+#[test]
+fn cluster_illegal_closed_words_error() {
+    // Unknown short letters, a repeated non-repeatable switch/option, a
+    // missing value, an illegal number, an illegal mixed word and an empty
+    // cluster all make the closed command line uncompletable.
+    for input in [
+        "-x [TAB]",
+        "-vv [TAB]",
+        "-v -v [TAB]",
+        "--verbose --verbose [TAB]",
+        "-nn3 [TAB]",
+        "-n3 -n2 [TAB]",
+        "--number 3 --number 2 [TAB]",
+        "-n- [TAB]",
+        "-n9 [TAB]",
+        "-n-- [TAB]",
+        "-n 9 [TAB]",
+        "-n3v [TAB]",
+        "-= [TAB]",
+        "-v= [TAB]",
+    ] {
+        assert_eq!(
+            complete_err(&mut cluster_command(), input),
+            "no completion generated",
+            "input {input}"
+        );
+    }
+
+    // A word the still-pending option cannot use as a value is illegal too.
+    for input in ["-n -v [TAB]", "-n --mode [TAB]", "-n -9 [TAB]"] {
+        assert_eq!(
+            complete_err(&mut cluster_command(), input),
+            "no completion generated",
+            "input {input}"
+        );
+    }
+
+    // An arg_index past the word sequence produces the existing error.
+    let err = clap_complete::engine::complete(
+        &mut cluster_command(),
+        vec!["tool".into(), "-v".into()],
+        2,
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.to_string(), "no completion generated");
+}
+
+#[test]
+fn cluster_edited_illegal_prefix_stays_non_error() {
+    // The same spellings while still under the cursor never raise the closed
+    // line's error: value prefixes simply have no candidate, while a short
+    // prefix keeps the existing cluster-continuation completion (its members
+    // are only validated once the word is closed).
+    for input in [
+        "-9[TAB]",
+        "-n9[TAB]",
+        "-n-9[TAB]",
+        "--number=9[TAB]",
+        "-nn3[TAB]",
+        "-n3v[TAB]",
+        "-n-3v[TAB]",
+    ] {
+        assert_data_eq!(complete!(cluster_command(), input), snapbox::str![""]);
+    }
+
+    assert_data_eq!(
+        complete!(cluster_command(), "-x[TAB]"),
+        snapbox::str![[r#"
+-xv	--verbose
+-xn	--number
+-xh	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(cluster_command(), "-vv[TAB]"),
+        snapbox::str![[r#"
+-vvv	--verbose
+-vvn	--number
+-vvh	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(cluster_command(), "-=[TAB]"),
+        snapbox::str![[r#"
+-=v	--verbose
+-=n	--number
+-=h	Print help
+"#]]
+    );
+    assert_data_eq!(
+        complete!(cluster_command(), "-v=[TAB]"),
+        snapbox::str![[r#"
+-v=v	--verbose
+-v=n	--number
+-v=h	Print help
+"#]]
+    );
+}
+
+#[test]
+fn cluster_mode_values_only_while_pending() {
+    assert_data_eq!(
+        complete!(cluster_command(), "--mode [TAB]"),
+        snapbox::str![[r#"
+fast
+safe
+"#]]
+    );
+    // A closed mode value returns ordinary completion, across both spellings.
+    let after = snapbox::str![[r#"
+--verbose
+--number
+--mode
+--help	Print help
+"#]];
+    for input in ["--mode fast [TAB]", "--mode=fast [TAB]"] {
+        assert_data_eq!(complete!(cluster_command(), input), after.clone());
+    }
+    // A closed illegal mode value is an error.
+    assert_eq!(
+        complete_err(&mut cluster_command(), "--mode junk [TAB]"),
+        "no completion generated"
+    );
+}
+
+#[test]
+fn cluster_repeated_calls_are_stable_and_stateless() {
+    let mut cmd = cluster_command();
+
+    // The canonical long name, the short cluster, `=` and separate values all
+    // give identical results on repeated calls, with no state carried between
+    // calls and the command definition left unchanged.
+    let expected = vec![
+        "--verbose".to_owned(),
+        "--number".to_owned(),
+        "--mode".to_owned(),
+        "--help".to_owned(),
+    ];
+    let lines = [
+        vec!["tool", "-vn-3", ""],
+        vec!["tool", "-n-3", ""],
+        vec!["tool", "-n", "-3", ""],
+        vec!["tool", "--number=-3", ""],
+        vec!["tool", "--number", "-3", ""],
+    ];
+    for words in lines {
+        let args: Vec<std::ffi::OsString> = words.iter().map(|w| (*w).into()).collect();
+        let index = args.len() - 1;
+        let first = complete_values(&mut cmd, args.clone(), index, None);
+        let second = complete_values(&mut cmd, args.clone(), index, None);
+        assert_eq!(first, expected, "words {words:?}");
+        assert_eq!(second, expected, "words {words:?}");
+    }
+
+    // The command still completes afresh from an empty word afterwards.
+    assert_data_eq!(
+        complete!(&mut cmd, "-[TAB]"),
+        snapbox::str![[r#"
+-v	--verbose
+-n	--number
+--mode
+-h	Print help
+"#]]
+    );
+}
+
 

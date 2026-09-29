@@ -18,6 +18,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - *(dynamic)* List a subcommand's canonical name instead of an alias that sorts ahead of it when both match the word being edited
 - *(dynamic)* Deduplicate completion candidates that propose the same insertion text from different sources
 - *(dynamic)* Complete the current `value_delimiter` segment of a multi-value argument independently of the segments already typed, respecting its value limit, suppressing already selected values and rejecting overfull or malformed values
+- *(dynamic)* Keep value taking stable when short clusters mix with a value-taking option: the taking flag stays the last cluster member, a negative number in the next word completes the option when it is an accepted value (so `-n -3`, `-n-3` and `--number=-3` match), a letter glued onto an attached value is an illegal mixed word, and unknown cluster members, repeated non-repeatable options, missing or invalid values and an empty cluster all produce "no completion generated"
 
 ## [4.6.10] - 2026-09-14
 

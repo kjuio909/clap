@@ -138,36 +138,43 @@ pub fn complete(
             }
         }
 
-        // While a dangling delimiter makes the next segment mandatory
-        // (`--opt=a,`), a closed word may only be that segment.  An option
-        // word (recognized or not) or `--` cannot fill it and clap rejects the
-        // line, so completion reports an error instead of guessing a stop or a
-        // new option. An option with `allow_hyphen_values` still accepts a
-        // hyphen-prefixed word as the segment. A plain value word below is
-        // consumed as the segment.
-        if let ParseState::Opt(state) = &current_state {
-            if state.open && !is_escaped && !opt_allows_hyphen(&current_state, &arg) {
-                let is_option_word = arg.is_escape()
-                    || arg.to_long().is_some()
-                    || arg
-                        .to_short()
-                        .is_some_and(|short| !short.is_negative_number());
-                if is_option_word {
-                    is_illegal = true;
+        // Decide how a word arriving while an option is taking values relates
+        // to that occurrence. Besides `allow_hyphen_values` (handled further
+        // down), clap also lets a dangling delimiter or an unmet minimum bind
+        // the next word to the option. A negative number is offered to the
+        // option when it is explicitly allowed (`allow_negative_numbers`) or
+        // names one of the option's fixed possible values, so e.g. `-n -3`
+        // completes the same as `-n-3` or `--number=-3`. Everything else that
+        // looks like an option either ends value taking early (an optional
+        // stop, only while the minimum is met and no segment is dangling) or
+        // makes the line invalid; it is never split apart or half-accepted.
+        let mut consume_as_value = opt_allows_hyphen(&current_state, &arg);
+        let mut reject_as_value_word = false;
+        let dispatch_state = if let ParseState::Opt(state) = &current_state {
+            if consumed_terminator.is_some() {
+                current_state.clone()
+            } else if state.closed {
+                // Once the value occurrence is complete, only the standalone
+                // terminator (already handled above) still belongs to it; any
+                // other word resumes ordinary option/positional parsing.
+                ParseState::ValueDone
+            } else if consume_as_value {
+                current_state.clone()
+            } else {
+                match classify_closed_value_word(state, &arg) {
+                    ClosedValueWord::Value => {
+                        consume_as_value = true;
+                        current_state.clone()
+                    }
+                    ClosedValueWord::Stop => ParseState::ValueDone,
+                    ClosedValueWord::Illegal => {
+                        reject_as_value_word = true;
+                        ParseState::ValueDone
+                    }
                 }
             }
-        }
-
-        // Once the value occurrence is complete, only the standalone terminator
-        // still belongs to it; any other word resumes ordinary option/positional
-        // parsing. This one-word window makes the terminator work identically
-        // across `=`, separate words, shorts and aliases.
-        let dispatch_state = if matches!(&current_state, ParseState::Opt(state) if state.closed)
-            && consumed_terminator.is_none()
-        {
-            ParseState::ValueDone
         } else {
-            current_state
+            current_state.clone()
         };
 
         if is_escaped {
@@ -180,11 +187,17 @@ pub fn complete(
                 // rejects makes the whole line uncompletable.
                 is_illegal = true;
             }
+        } else if reject_as_value_word {
+            // The word arrived while an option still bound it (a dangling
+            // segment, an unmet minimum, or a non-optional occurrence) but
+            // cannot be a value; clap rejects the line even when the word is
+            // `--` itself.
+            is_illegal = true;
         } else if arg.is_escape() {
             is_escaped = true;
         } else if consumed_terminator.is_some() {
             next_state = ParseState::ValueDone;
-        } else if opt_allows_hyphen(&dispatch_state, &arg) {
+        } else if consume_as_value {
             match dispatch_state {
                 ParseState::Opt(state) => {
                     next_state = advance_opt_value(state, arg.to_value_os(), &mut is_illegal);
@@ -204,8 +217,11 @@ pub fn complete(
                 });
 
                 if let Some(opt) = opt {
+                    if !arg_may_repeat(current_cmd, opt) && explicit_opts.contains(opt.get_id()) {
+                        is_illegal = true;
+                    }
                     explicit_opts.insert(opt.get_id().clone());
-                    if opt.get_num_args().expect("built").takes_values() {
+                    if opt.get_num_args().expect("built").takes_values() && !is_illegal {
                         match value {
                             // A bare `--name` still expects its value as the next word.
                             None => next_state = ParseState::Opt(OptState::new(opt, 1)),
@@ -235,34 +251,33 @@ pub fn complete(
                 is_illegal = true;
             }
         } else if let Some(short) = arg.to_short() {
-            let (leading_flags, takes_value_opt, mut short, cluster_valid) =
-                parse_shortflags(current_cmd, short);
-            // Only a cluster made entirely of recognized flags records state.
-            // Splitting an invalid short string into known and unknown members
-            // would be guesswork and could suppress conflicting candidates, so
-            // invalid clusters keep the existing completion behavior; clap's
-            // parser would reject them anyway.
-            if cluster_valid {
-                // Every recognized flag in the cluster was explicitly supplied.
-                for flag in leading_flags.chars() {
-                    if let Some(opt) = current_cmd.get_arguments().find(|a| {
-                        a.get_short_and_visible_aliases()
-                            .is_some_and(|shorts| shorts.contains(&flag))
-                    }) {
-                        explicit_opts.insert(opt.get_id().clone());
-                    }
-                }
-            }
-            if let Some(opt) = takes_value_opt {
-                if let Some(remainder) = short.next_value_os() {
-                    // A closed `-ovalue` / `-o=value` word; advance like the
-                    // long `--opt=value` form.
-                    let value = remainder.strip_prefix("=").unwrap_or(remainder);
-                    next_state = attached_opt_state(opt, value, &mut is_illegal);
-                } else {
-                    next_state = ParseState::Opt(OptState::new(opt, 1));
-                }
-            } else if pos_allows_hyphen(current_cmd, pos_index) {
+            // A negative number is first offered to the pending option
+            // (already folded into `consume_as_value` above). As a standalone
+            // word it can only fill a positional that explicitly allows
+            // negative numbers; it is never scanned as a short cluster.
+            let negative_number = short.is_negative_number();
+            // clap routes a cluster that contains any char naming no short
+            // option to a hyphen-accepting positional instead of scanning it,
+            // so a word like `-n3v` can be one positional value but is never
+            // half a flag and half an option value.
+            let hyphen_positional = !negative_number
+                && pos_allows_hyphen(current_cmd, pos_index)
+                && cluster_has_unknown_member(current_cmd, short.clone());
+            // A standalone negative number fills a positional that accepts
+            // negative numbers explicitly, or that accepts any hyphen value
+            // when the word also contains a character naming no short (the
+            // same heuristic clap uses to route `-3` away from a cluster).
+            let negative_as_positional = negative_number
+                && (pos_accepts_negative_number(current_cmd, pos_index)
+                    || (pos_allows_hyphen(current_cmd, pos_index)
+                        && cluster_has_unknown_member(current_cmd, short.clone())));
+
+            if negative_number && !negative_as_positional {
+                // Not a pending option value (consume_as_value) and no
+                // accepting positional: clap reports an unknown argument,
+                // never an option or cluster to complete.
+                is_illegal = true;
+            } else if negative_as_positional || hyphen_positional {
                 let accepted =
                     closed_positional_is_accepted(current_cmd, pos_index, arg.to_value_os());
                 (next_state, pos_index) =
@@ -270,12 +285,52 @@ pub fn complete(
                 if !accepted {
                     is_illegal = true;
                 }
+            } else {
+                let (leading_flags, takes_value_opt, mut short, cluster_valid) =
+                    parse_shortflags(current_cmd, short);
+                // Every scanned member must name an option. An unknown member
+                // (or invalid UTF-8) cannot be split into known and unknown
+                // parts: clap rejects the whole word, so completion reports an
+                // error rather than guessing a cluster.
+                if !cluster_valid {
+                    is_illegal = true;
+                } else {
+                    // Record every recognized member, including the taking
+                    // option itself, rejecting a repeat of an argument that may
+                    // only occur once; a Count/Append option and an overriding
+                    // occurrence are allowed to repeat.
+                    for flag in leading_flags.chars() {
+                        if let Some(opt) = current_cmd.get_arguments().find(|a| {
+                            a.get_short_and_visible_aliases()
+                                .is_some_and(|shorts| shorts.contains(&flag))
+                        }) {
+                            if !arg_may_repeat(current_cmd, opt)
+                                && explicit_opts.contains(opt.get_id())
+                            {
+                                is_illegal = true;
+                            }
+                            explicit_opts.insert(opt.get_id().clone());
+                        }
+                    }
+                    if let Some(opt) = takes_value_opt {
+                        if !is_illegal {
+                            if let Some(remainder) = short.next_value_os() {
+                                // A closed `-ovalue` / `-o=value` word; advance
+                                // like the long `--opt=value` form.  When the
+                                // glued value cannot name one of the option's
+                                // values (`-n3v`, `-n9`), the word is illegal
+                                // rather than a cluster with a trailing flag.
+                                let value = remainder.strip_prefix("=").unwrap_or(remainder);
+                                next_state = attached_opt_state(opt, value, &mut is_illegal);
+                            } else {
+                                // A bare `-o` still expects its value as the
+                                // next word; it must be the last cluster member.
+                                next_state = ParseState::Opt(OptState::new(opt, 1));
+                            }
+                        }
+                    }
+                }
             }
-            // An invalid short cluster (an unknown member, or no
-            // value-taking option) deliberately keeps the legacy completion
-            // behavior rather than flagging the line: its members are not
-            // guessed apart, and the cursor word still completes on this
-            // level.
         } else {
             match dispatch_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
@@ -411,9 +466,23 @@ fn consume_opt_word<'a>(
     let mut used = prior.used;
 
     let Some(delim) = is_bounded_delimited(opt) else {
-        // Legacy behavior: count whole shell words against the range; whatever
-        // is packed behind a delimiter does not extend or shorten the count.
-        // An attached value always closes the occurrence.
+        // Count whole shell words against the range; an attached value always
+        // closes the occurrence.
+        //
+        // A single-value argument may still pack arbitrary delimiter segments
+        // into one word (clap allows it), and completion keeps that legacy
+        // behavior rather than validating the packed string.  With no
+        // delimiter in play, a closed word must name a value the option
+        // accepts, including everything glued behind the taking short flag
+        // (`-n3v`) or `=`; an unknown value can never be part of a valid
+        // command line, so the line fails instead of completing as though the
+        // occurrence had finished.
+        let packed_delimiter = opt
+            .get_value_delimiter()
+            .is_some_and(|delim| value.contains(delim.encode_utf8(&mut [0_u8; 4])));
+        if !packed_delimiter && !possible_value_matches(opt, value) {
+            return Err(());
+        }
         return Ok(if !attached && ordinal < max {
             Some(OptState {
                 opt,
@@ -1550,6 +1619,36 @@ fn pos_allows_hyphen(cmd: &clap::Command, pos_index: usize) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the positional slot at `pos_index` accepts a negative number word.
+fn pos_accepts_negative_number(cmd: &clap::Command, pos_index: usize) -> bool {
+    cmd.get_positionals()
+        .find(|a| a.get_index() == Some(pos_index))
+        .map(|p| p.is_allow_negative_numbers_set())
+        .unwrap_or(false)
+}
+
+/// Whether any character of a short cluster is not a recognized short option,
+/// matching clap parser's heuristic that routes the whole word to a
+/// hyphen-accepting positional instead of scanning it as flags.
+fn cluster_has_unknown_member(cmd: &clap::Command, mut short: clap_lex::ShortFlags<'_>) -> bool {
+    let mut unknown = false;
+    while let Some(flag) = short.next_flag() {
+        match flag {
+            Ok(flag) => {
+                let known = cmd.get_arguments().any(|a| {
+                    a.get_short_and_visible_aliases()
+                        .is_some_and(|shorts| shorts.contains(&flag))
+                });
+                if !known {
+                    unknown = true;
+                }
+            }
+            Err(_) => unknown = true,
+        }
+    }
+    unknown
+}
+
 fn opt_allows_hyphen(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> bool {
     let val = arg.to_value_os();
     if val.starts_with("-") {
@@ -1559,6 +1658,92 @@ fn opt_allows_hyphen(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> b
     }
 
     false
+}
+
+/// How a closed word relates to an option occurrence still taking values.
+enum ClosedValueWord {
+    /// The word is another value of the pending option (a plain word, `-`, or a
+    /// negative number the option accepts).
+    Value,
+    /// The minimum is already met, so the option-shaped word may end value
+    /// taking early and resume ordinary option/positional parsing.
+    Stop,
+    /// The word still has to be a value (a dangling segment or an unmet
+    /// minimum) but cannot be one; clap rejects the line.
+    Illegal,
+}
+
+/// Classify a closed word arriving while `state`'s option is taking values.
+fn classify_closed_value_word(
+    state: &OptState<'_>,
+    arg: &clap_lex::ParsedArg<'_>,
+) -> ClosedValueWord {
+    let opt = state.opt;
+    let min = opt.get_num_args().expect("built").min_values();
+    let consumed_words = state.word.saturating_sub(1);
+    let mandatory = state.open || consumed_words < min;
+
+    // A negative number looks like a short cluster; clap feeds it to the
+    // option only when `allow_negative_numbers` is set or it names one of the
+    // option's fixed values, so `-n -3` parses like `-n-3` or `--number=-3`.
+    // Otherwise the word is option-shaped and ends value taking early (when
+    // the minimum is met) or makes the line invalid (while a value is owed).
+    let mut value_is_negative = false;
+    if let Some(short) = arg.to_short() {
+        if short.is_negative_number() {
+            value_is_negative = true;
+            let allowed = opt.is_allow_negative_numbers_set()
+                || possible_value_matches(opt, arg.to_value_os());
+            if allowed {
+                return ClosedValueWord::Value;
+            }
+        }
+    }
+
+    // Everything else that looks like an option, an escape or a short cluster
+    // cannot be glued into the value; it may only end value taking once the
+    // minimum is met and no segment is left dangling.
+    let is_option_word =
+        value_is_negative || arg.is_escape() || arg.to_long().is_some() || arg.to_short().is_some();
+    if is_option_word && mandatory {
+        ClosedValueWord::Illegal
+    } else if is_option_word {
+        ClosedValueWord::Stop
+    } else {
+        ClosedValueWord::Value
+    }
+}
+
+/// Whether a whole closed value word is accepted by an option's fixed value set.
+///
+/// Options without possible values accept anything; comparison honors
+/// `ignore_case`. Unlike the cursor-side segment check, an empty value is not
+/// tolerated: a closed empty word never satisfies the option.
+fn possible_value_matches(opt: &clap::Arg, value: &OsStr) -> bool {
+    let Some(possible) = possible_values(opt) else {
+        return true;
+    };
+    let possible: Vec<_> = possible.collect();
+    let Some(value) = value.to_str() else {
+        return false;
+    };
+    let ignore_case = opt.is_ignore_case_set();
+    possible.iter().any(|pv| pv.matches(value, ignore_case))
+}
+
+/// Whether an option may be supplied more than once on one command line,
+/// mirroring clap's parser: a `Count`/`Append` action repeats, and an
+/// occurrence overrides itself through `overrides_with` (or the command-wide
+/// `args_override_self`).
+fn arg_may_repeat(cmd: &clap::Command, opt: &clap::Arg) -> bool {
+    matches!(
+        opt.get_action(),
+        clap::ArgAction::Count | clap::ArgAction::Append
+    ) || cmd.is_args_override_self()
+        || opt
+            .get_overrides_with()
+            .flat_map(|id| unroll_group(cmd, id))
+            .any(|id| &id == opt.get_id())
 }
 
 /// Arguments that must not be offered because they conflict with an explicitly
