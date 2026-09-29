@@ -111,9 +111,7 @@ pub fn complete(
         }
 
         if is_escaped {
-            let positional = current_cmd
-                .get_positionals()
-                .find(|p| p.get_index() == Some(pos_index));
+            let positional = positional_at(current_cmd, pos_index);
             if let Some(positional) = positional {
                 if !is_valid_value(positional, arg.to_value_os()) {
                     debug!(
@@ -173,9 +171,7 @@ pub fn complete(
                         next_state = ParseState::Opt((opt, 1));
                     };
                 } else if pos_allows_hyphen(current_cmd, pos_index) {
-                    let positional = current_cmd
-                        .get_positionals()
-                        .find(|p| p.get_index() == Some(pos_index));
+                    let positional = positional_at(current_cmd, pos_index);
                     if let Some(positional) = positional {
                         if !is_valid_value(positional, arg.to_value_os()) {
                             debug!(
@@ -219,9 +215,7 @@ pub fn complete(
                     next_state = ParseState::Opt((opt, 1));
                 }
             } else if pos_allows_hyphen(current_cmd, pos_index) {
-                let positional = current_cmd
-                    .get_positionals()
-                    .find(|p| p.get_index() == Some(pos_index));
+                let positional = positional_at(current_cmd, pos_index);
                 if let Some(positional) = positional {
                     if !is_valid_value(positional, arg.to_value_os()) {
                         debug!(
@@ -238,9 +232,7 @@ pub fn complete(
         } else {
             match current_state {
                 ParseState::ValueDone | ParseState::Pos(..) => {
-                    let positional = current_cmd
-                        .get_positionals()
-                        .find(|p| p.get_index() == Some(pos_index));
+                    let positional = positional_at(current_cmd, pos_index);
                     let Some(positional) = positional else {
                         debug!("complete: unrecognized argument={:?}", arg.to_value_os());
                         return Ok(Vec::new());
@@ -321,78 +313,117 @@ fn complete_arg(
         }
     }
 
-    let mut completions = Vec::<CompletionCandidate>::new();
+    // A cursor token carrying an attached long value (`--flag=value`) is
+    // completed by that option alone, exactly like the independent
+    // `--flag value` spelling. Handling it before the regular state match
+    // keeps positional, subcommand and option candidates from leaking in
+    // based on the whole token.
+    let mut state = state;
 
-    match state {
-        ParseState::ValueDone => {
-            // After `--`, subcommands are no longer recognized; every token is
-            // parsed as a positional value.
-            if !is_escaped {
-                if let Ok(value) = arg.to_value() {
-                    completions.extend(complete_subcommand(value, cmd));
-                }
+    // Mirror the committed-token rule for the token under the cursor: when it
+    // itself looks like an option, a pending optional value is omitted (the
+    // token is processed on its own), while a missing required value
+    // invalidates the command line.
+    if let ParseState::Opt((opt, count)) = &state {
+        if !is_escaped && !opt.is_allow_hyphen_values_set() && looks_like_option(arg) {
+            let min = opt.get_num_args().expect("built").min_values();
+            if min > 0 && *count <= min {
+                debug!(
+                    "complete: missing required value for opt={:?} at cursor",
+                    opt.get_id()
+                );
+                return Ok(Vec::new());
             }
-
-            if let Some(positional) = cmd
-                .get_positionals()
-                .find(|p| p.get_index() == Some(pos_index))
-            {
-                completions.extend(complete_arg_value(
-                    arg.to_value(),
-                    positional,
-                    current_dir,
-                    0,
-                ));
-            }
-            if !is_escaped {
-                completions.extend(complete_option(arg, cmd, current_dir));
+            if min == 0 {
+                debug!(
+                    "complete: omitting optional value of opt={:?} at cursor",
+                    opt.get_id()
+                );
+                state = ParseState::ValueDone;
             }
         }
-        ParseState::Pos((_, num_arg)) => {
-            if let Some(positional) = cmd
-                .get_positionals()
-                .find(|p| p.get_index() == Some(pos_index))
-            {
-                completions.extend(complete_arg_value(
-                    arg.to_value(),
-                    positional,
-                    current_dir,
-                    num_arg.saturating_sub(1),
-                ));
-                if !is_escaped
-                    && positional
-                        .get_num_args()
-                        .is_some_and(|num_args| num_arg >= num_args.min_values())
-                {
+    }
+
+    let attached_long_value = (!is_escaped
+        && matches!(state, ParseState::ValueDone | ParseState::Pos(..)))
+    .then(|| cursor_attached_long_value(cmd, arg))
+    .flatten();
+
+    let mut completions = Vec::<CompletionCandidate>::new();
+
+    if let Some((opt, value)) = attached_long_value {
+        completions.extend(complete_arg_value(
+            value.to_str().ok_or(value),
+            opt,
+            current_dir,
+            0,
+        ));
+    } else {
+        match state {
+            ParseState::ValueDone => {
+                // After `--`, subcommands are no longer recognized; every token is
+                // parsed as a positional value.
+                if !is_escaped {
+                    if let Ok(value) = arg.to_value() {
+                        completions.extend(complete_subcommand(value, cmd));
+                    }
+                }
+
+                if let Some(positional) = positional_at(cmd, pos_index) {
+                    completions.extend(complete_arg_value(
+                        arg.to_value(),
+                        positional,
+                        current_dir,
+                        0,
+                    ));
+                }
+                if !is_escaped {
                     completions.extend(complete_option(arg, cmd, current_dir));
                 }
             }
-        }
-        ParseState::Opt((opt, count)) => {
-            completions.extend(complete_arg_value(
-                arg.to_value(),
-                opt,
-                current_dir,
-                count.saturating_sub(1),
-            ));
-            let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
-            // An option whose value is optional (a minimum of zero values)
-            // always serves its own value at the first value slot; falling back
-            // to flags and positionals here would let `--color <TAB>` mix
-            // color values with unrelated candidates. Options that require at
-            // least one value keep offering the alternatives once their
-            // required values have been supplied.
-            if count > min && min > 0 {
-                // Also complete this raw_arg as a positional argument, flags, options and subcommand.
-                completions.extend(complete_arg(
-                    arg,
-                    cmd,
+            ParseState::Pos((_, num_arg)) => {
+                if let Some(positional) = positional_at(cmd, pos_index) {
+                    completions.extend(complete_arg_value(
+                        arg.to_value(),
+                        positional,
+                        current_dir,
+                        num_arg.saturating_sub(1),
+                    ));
+                    if !is_escaped
+                        && positional
+                            .get_num_args()
+                            .is_some_and(|num_args| num_arg >= num_args.min_values())
+                    {
+                        completions.extend(complete_option(arg, cmd, current_dir));
+                    }
+                }
+            }
+            ParseState::Opt((opt, count)) => {
+                completions.extend(complete_arg_value(
+                    arg.to_value(),
+                    opt,
                     current_dir,
-                    pos_index,
-                    is_escaped,
-                    ParseState::ValueDone,
-                    seen_options,
-                )?);
+                    count.saturating_sub(1),
+                ));
+                let min = opt.get_num_args().map(|r| r.min_values()).unwrap_or(0);
+                // An option whose value is optional (a minimum of zero values)
+                // always serves its own value at the first value slot; falling back
+                // to flags and positionals here would let `--color <TAB>` mix
+                // color values with unrelated candidates. Options that require at
+                // least one value keep offering the alternatives once their
+                // required values have been supplied.
+                if count > min && min > 0 {
+                    // Also complete this raw_arg as a positional argument, flags, options and subcommand.
+                    completions.extend(complete_arg(
+                        arg,
+                        cmd,
+                        current_dir,
+                        pos_index,
+                        is_escaped,
+                        ParseState::ValueDone,
+                        seen_options,
+                    )?);
+                }
             }
         }
     }
@@ -472,11 +503,19 @@ fn complete_option(
         if let Ok(flag) = flag {
             if let Some(value) = value {
                 if let Some(arg) = cmd.get_arguments().find(|a| a.get_long() == Some(flag)) {
-                    completions.extend(
-                        complete_arg_value(value.to_str().ok_or(value), arg, current_dir, 0)
-                            .into_iter()
-                            .map(|comp| comp.add_prefix(format!("--{flag}="))),
-                    );
+                    // The attached (`--flag=value`) and independent
+                    // (`--flag value`) spellings share one candidate
+                    // semantics: the candidates name the value alone, never
+                    // the `--flag=` prefix. The token under the cursor is left
+                    // untouched, so callers that want the prefix reattached
+                    // (e.g. shell adapters replacing the whole word) can do so
+                    // themselves from that token.
+                    completions.extend(complete_arg_value(
+                        value.to_str().ok_or(value),
+                        arg,
+                        current_dir,
+                        0,
+                    ));
                 }
             } else {
                 completions.extend(
@@ -846,9 +885,7 @@ fn parse_positional<'a>(
     is_escaped: bool,
     state: ParseState<'a>,
 ) -> (ParseState<'a>, usize) {
-    let pos_arg = cmd
-        .get_positionals()
-        .find(|p| p.get_index() == Some(pos_index));
+    let pos_arg = positional_at(cmd, pos_index);
     let num_args = pos_arg
         .and_then(|a| a.get_num_args().map(|r| r.max_values()))
         .unwrap_or(1);
@@ -902,10 +939,32 @@ fn parse_opt_value(opt: &clap::Arg, count: usize) -> ParseState<'_> {
 }
 
 fn pos_allows_hyphen(cmd: &clap::Command, pos_index: usize) -> bool {
-    cmd.get_positionals()
-        .find(|a| a.get_index() == Some(pos_index))
+    positional_at(cmd, pos_index)
         .map(|p| p.is_allow_hyphen_values_set())
         .unwrap_or(false)
+}
+
+/// Resolve the positional argument that owns `pos_index`.
+///
+/// Positional indices mark the first token an argument claims; a repeatable
+/// trailing positional ([`clap::ArgAction::Append`]) keeps claiming every
+/// following position on each new occurrence, so an exact lookup misses its
+/// later values.
+fn positional_at(cmd: &clap::Command, pos_index: usize) -> Option<&clap::Arg> {
+    let positionals: Vec<_> = cmd.get_positionals().collect();
+    if let Some(found) = positionals
+        .iter()
+        .copied()
+        .find(|p| p.get_index() == Some(pos_index))
+    {
+        return Some(found);
+    }
+    positionals
+        .iter()
+        .copied()
+        .filter(|p| p.get_index().is_some_and(|i| i <= pos_index))
+        .max_by_key(|p| p.get_index())
+        .filter(|p| can_repeat(p) && p.get_num_args().expect("built").takes_values())
 }
 
 fn opt_allows_hyphen(state: &ParseState<'_>, arg: &clap_lex::ParsedArg<'_>) -> bool {
@@ -957,6 +1016,26 @@ fn cursor_option<'c>(
     } else {
         None
     }
+}
+
+/// Resolve the option and attached value of a cursor token shaped
+/// `--flag=value` (the value may be empty).
+fn cursor_attached_long_value<'c, 's>(
+    cmd: &'c clap::Command,
+    arg: &clap_lex::ParsedArg<'s>,
+) -> Option<(&'c clap::Arg, &'s OsStr)> {
+    let (flag, value) = arg.to_long()?;
+    let flag = flag.ok()?;
+    let value = value?;
+    let opt = cmd.get_arguments().find(|a| {
+        a.get_long_and_visible_aliases()
+            .map(|longs| longs.into_iter().any(|long| long == flag))
+            .unwrap_or(false)
+    })?;
+    if !opt.get_num_args().expect("built").takes_values() {
+        return None;
+    }
+    Some((opt, value))
 }
 
 /// Validate a value already committed on the command line (not the token under

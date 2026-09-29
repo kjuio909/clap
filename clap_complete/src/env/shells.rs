@@ -3,6 +3,24 @@ use std::str::FromStr;
 
 use super::EnvCompleter;
 
+/// Extract the `--flag=` prefix of a cursor token carrying an attached long
+/// value.
+///
+/// The completion engine proposes bare values for both `--flag value` and
+/// `--flag=value`; shells replace the whole current word, so the attached
+/// spelling needs the prefix reattached here. Independent values and short
+/// options (`-f=value`, whose candidates already carry their prefix) yield
+/// `None`.
+fn attached_long_prefix(args: &[OsString], index: usize) -> Option<String> {
+    let token = args.get(index)?.to_str()?;
+    let eq = token.find('=')?;
+    let flag = &token[..eq];
+    if flag.len() <= 2 || !flag.starts_with("--") {
+        return None;
+    }
+    Some(token[..=eq].to_owned())
+}
+
 /// Bash completion adapter
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct Bash;
@@ -88,13 +106,14 @@ fi
             .ok()
             .and_then(|i| i.parse().ok());
         let ifs: Option<String> = std::env::var("_CLAP_IFS").ok().and_then(|i| i.parse().ok());
+        let prefix = attached_long_prefix(&args, index).unwrap_or_default();
         let completions = crate::engine::complete(cmd, args, index, current_dir)?;
 
         for (i, candidate) in completions.iter().enumerate() {
             if i != 0 {
                 write!(buf, "{}", ifs.as_deref().unwrap_or("\n"))?;
             }
-            write!(buf, "{}", candidate.get_value().to_string_lossy())?;
+            write!(buf, "{prefix}{}", candidate.get_value().to_string_lossy())?;
         }
         Ok(())
     }
@@ -182,13 +201,14 @@ set edit:completion:arg-completer[BIN] = { |@words|
             .and_then(|i| i.parse().ok())
             .unwrap_or_default();
         let ifs: Option<String> = std::env::var("_CLAP_IFS").ok().and_then(|i| i.parse().ok());
+        let prefix = attached_long_prefix(&args, index).unwrap_or_default();
         let completions = crate::engine::complete(cmd, args, index, current_dir)?;
 
         for (i, candidate) in completions.iter().enumerate() {
             if i != 0 {
                 write!(buf, "{}", ifs.as_deref().unwrap_or("\n"))?;
             }
-            write!(buf, "{}", candidate.get_value().to_string_lossy())?;
+            write!(buf, "{prefix}{}", candidate.get_value().to_string_lossy())?;
         }
         Ok(())
     }
@@ -229,10 +249,11 @@ impl EnvCompleter for Fish {
         buf: &mut dyn std::io::Write,
     ) -> Result<(), std::io::Error> {
         let index = args.len() - 1;
+        let prefix = attached_long_prefix(&args, index).unwrap_or_default();
         let completions = crate::engine::complete(cmd, args, index, current_dir)?;
 
         for candidate in completions {
-            write!(buf, "{}", candidate.get_value().to_string_lossy())?;
+            write!(buf, "{prefix}{}", candidate.get_value().to_string_lossy())?;
             if let Some(help) = candidate.get_help() {
                 write!(
                     buf,
@@ -379,10 +400,11 @@ Register-ArgumentCompleter -Native -CommandName {bin} -ScriptBlock {{
         buf: &mut dyn std::io::Write,
     ) -> Result<(), std::io::Error> {
         let index = args.len() - 1;
+        let prefix = attached_long_prefix(&args, index).unwrap_or_default();
         let completions = crate::engine::complete(cmd, args, index, current_dir)?;
 
         for candidate in completions {
-            write!(buf, "{}", candidate.get_value().to_string_lossy())?;
+            write!(buf, "{prefix}{}", candidate.get_value().to_string_lossy())?;
             if let Some(help) = candidate.get_help() {
                 write!(
                     buf,
@@ -482,6 +504,7 @@ compdef _clap_dynamic_completer_NAME BIN"#
         if args.len() == index {
             args.push("".into());
         }
+        let prefix = attached_long_prefix(&args, index).unwrap_or_default();
         let completions = crate::engine::complete(cmd, args, index, current_dir)?;
 
         for (i, candidate) in completions.iter().enumerate() {
@@ -490,7 +513,7 @@ compdef _clap_dynamic_completer_NAME BIN"#
             }
             write!(
                 buf,
-                "{}",
+                "{prefix}{}",
                 Self::escape_value(&candidate.get_value().to_string_lossy())
             )?;
             if let Some(help) = candidate.get_help() {

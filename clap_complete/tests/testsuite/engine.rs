@@ -124,12 +124,12 @@ fn suggest_hidden_possible_value() {
 
     assert_data_eq!(
         complete!(cmd, "--test=test"),
-        snapbox::str!["--test=test-visible	Say hello to the world"]
+        snapbox::str!["test-visible	Say hello to the world"]
     );
 
     assert_data_eq!(
         complete!(cmd, "--test=test-h"),
-        snapbox::str!["--test=test-hidden	Say hello to the moon"]
+        snapbox::str!["test-hidden	Say hello to the moon"]
     );
 }
 
@@ -1192,9 +1192,9 @@ tab
     assert_data_eq!(
         complete!(cmd, "--delimiter=[TAB]"),
         snapbox::str![[r#"
---delimiter=comma
---delimiter=space
---delimiter=tab
+comma
+space
+tab
 "#]]
     );
 
@@ -1202,7 +1202,7 @@ tab
 
     assert_data_eq!(
         complete!(cmd, "--delimiter=c[TAB]"),
-        snapbox::str!["--delimiter=comma"]
+        snapbox::str!["comma"]
     );
 
     assert_data_eq!(
@@ -1217,12 +1217,9 @@ comma,tab
     assert_data_eq!(
         complete!(cmd, "--delimiter=comma,[TAB]"),
         snapbox::str![[r#"
---delimiter=comma,a_pos
---delimiter=comma,b_pos
---delimiter=comma,c_pos
---delimiter=comma,comma
---delimiter=comma,space
---delimiter=comma,tab
+comma,comma
+comma,space
+comma,tab
 "#]]
     );
 
@@ -1233,7 +1230,7 @@ comma,tab
 
     assert_data_eq!(
         complete!(cmd, "--delimiter=comma,s[TAB]"),
-        snapbox::str!["--delimiter=comma,space"]
+        snapbox::str!["comma,space"]
     );
 
     assert_data_eq!(
@@ -1622,8 +1619,9 @@ fn suggest_custom_arg_value_candidates_via_alias() {
     assert!(complete_argv(&mut cmd, &["tool", "inspect", "--name", "z"]).is_empty());
     assert!(complete_argv(&mut cmd, &["tool", "i", "--name", "z"]).is_empty());
 
-    // `--name=value` keeps the `=` and the typed prefix in the candidates
-    let expected = vec!["--name=alice", "--name=alina"];
+    // `--name=value` names the same bare values as `--name value`; the
+    // `--name=` prefix is never part of the candidate text.
+    let expected = vec!["alice", "alina"];
     assert_eq!(
         complete_argv(&mut cmd, &["tool", "inspect", "--name=al"]),
         expected
@@ -1871,7 +1869,6 @@ fn interleaved_value_command() -> Command {
 #[test]
 fn suggest_interleaved_value_options() {
     let colors = vec!["auto", "always", "never"];
-    let eq_colors = vec!["--color=auto", "--color=always", "--color=never"];
     let formats = vec!["json", "yaml"];
 
     // The value position of an optional-value option serves only that option's
@@ -1884,13 +1881,14 @@ fn suggest_interleaved_value_options() {
         complete_argv(&mut interleaved_value_command(), &["tool", "--color", "au"]),
         vec!["auto"]
     );
+    // The attached spelling names the same bare candidates, item by item.
     assert_eq!(
         complete_argv(&mut interleaved_value_command(), &["tool", "--color="]),
-        eq_colors
+        colors
     );
     assert_eq!(
         complete_argv(&mut interleaved_value_command(), &["tool", "--color=au"]),
-        vec!["--color=auto"]
+        vec!["auto"]
     );
 
     // The required-value option behaves the same way.
@@ -1907,7 +1905,7 @@ fn suggest_interleaved_value_options() {
     );
     assert_eq!(
         complete_argv(&mut interleaved_value_command(), &["tool", "--format=ya"]),
-        vec!["--format=yaml"]
+        vec!["yaml"]
     );
 
     // `--color` followed directly by another option treats the optional value
@@ -1949,7 +1947,6 @@ fn suggest_interleaved_value_options() {
 #[test]
 fn suggest_repeated_optional_value_option() {
     let colors = vec!["auto", "always", "never"];
-    let eq_colors = vec!["--color=auto", "--color=always", "--color=never"];
 
     // Every occurrence of a repeatable option offers the full candidate set in
     // declaration order; previous values never narrow later candidates.
@@ -1967,23 +1964,25 @@ fn suggest_repeated_optional_value_option() {
         ),
         colors
     );
+    // Attached and independent spellings agree item by item; only the token
+    // under the cursor carries the prefix, never the candidate text.
     assert_eq!(
         complete_argv(
             &mut interleaved_value_command(),
             &["tool", "--color=auto", "--color="]
         ),
-        eq_colors
+        colors
     );
     assert_eq!(
         complete_argv(
             &mut interleaved_value_command(),
             &["tool", "--color", "auto", "--color=au"]
         ),
-        vec!["--color=auto"]
+        vec!["auto"]
     );
 
     // The independent and attached spellings produce the same candidates at the
-    // same value position, differing only by the `--color=` prefix.
+    // same value position.
     assert_eq!(
         complete_argv(
             &mut interleaved_value_command(),
@@ -1996,7 +1995,7 @@ fn suggest_repeated_optional_value_option() {
             &mut interleaved_value_command(),
             &["tool", "--color=auto", "--color="]
         ),
-        eq_colors
+        colors
     );
 }
 
@@ -2106,9 +2105,426 @@ fn suggest_value_options_state_isolated_across_calls() {
     assert!(complete_argv(&mut cmd, &["tool", "--color=bad"]).is_empty());
     assert_eq!(
         complete_argv(&mut cmd, &["tool", "--color=au"]),
-        vec!["--color=auto"]
+        vec!["auto"]
     );
     assert_eq!(complete_argv(&mut cmd, &["tool", "--color", ""]), colors);
+}
+
+/// Root command for the attached-vs-independent value completion parity
+/// scenarios.
+///
+/// `--color` is repeatable with an optional value, `--format` requires one,
+/// `--mode` takes a single value, `--tag` is a repeatable multi-value option,
+/// `--template` sources values from a custom provider and `files` is a
+/// repeatable positional.
+fn parity_value_command() -> Command {
+    fn template_candidates() -> Vec<CompletionCandidate> {
+        vec![
+            CompletionCandidate::new("daily"),
+            CompletionCandidate::new("weekly"),
+        ]
+    }
+
+    Command::new("tool")
+        .arg(
+            clap::Arg::new("color")
+                .long("color")
+                .action(clap::ArgAction::Append)
+                .num_args(0..=1)
+                .value_parser(["auto", "always", "never"]),
+        )
+        .arg(
+            clap::Arg::new("format")
+                .long("format")
+                .required(true)
+                .value_parser(["json", "yaml"]),
+        )
+        .arg(
+            clap::Arg::new("mode")
+                .long("mode")
+                .value_parser(["fast", "safe"]),
+        )
+        .arg(
+            clap::Arg::new("tag")
+                .long("tag")
+                .action(clap::ArgAction::Append)
+                .num_args(1..=2)
+                .value_parser(["red", "blue"]),
+        )
+        .arg(
+            clap::Arg::new("template")
+                .long("template")
+                .add(ArgValueCandidates::new(template_candidates)),
+        )
+        .arg(
+            clap::Arg::new("files")
+                .action(clap::ArgAction::Append)
+                .value_parser(["a.txt", "b.txt"]),
+        )
+}
+
+#[test]
+fn suggest_attached_and_independent_parity() {
+    // Fixed sets are produced in declaration order, without duplicates.
+    let colors = vec!["auto", "always", "never"];
+    let formats = vec!["json", "yaml"];
+    let modes = vec!["fast", "safe"];
+    let tags = vec!["red", "blue"];
+    let templates = vec!["daily", "weekly"];
+    let files = vec!["a.txt", "b.txt"];
+
+    // `--color ` offers all three color values.
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--color", ""]),
+        colors
+    );
+    // The attached prefix never appears in the candidate text.
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--color=au"]),
+        vec!["auto"]
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--color="]),
+        colors
+    );
+
+    // The two spellings are identical item by item for `--format`.
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--format", ""]),
+        formats
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--format="]),
+        formats
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--format", "ya"]),
+        vec!["yaml"]
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--format=ya"]),
+        vec!["yaml"]
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--format", "js"]),
+        vec!["json"]
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--format=js"]),
+        vec!["json"]
+    );
+
+    // The remaining fixed sets each serve only their own candidates.
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--mode", ""]),
+        modes
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--mode=sa"]),
+        vec!["safe"]
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--tag", ""]),
+        tags
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--tag="]),
+        tags
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--tag=re"]),
+        vec!["red"]
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--template", ""]),
+        templates
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--template="]),
+        templates
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--template=da"]),
+        vec!["daily"]
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--", ""]),
+        files
+    );
+    assert_eq!(
+        complete_argv(&mut parity_value_command(), &["tool", "--", "a"]),
+        vec!["a.txt"]
+    );
+}
+
+#[test]
+fn suggest_attached_does_not_leak_previous_option() {
+    let formats = vec!["json", "yaml"];
+
+    // `--color` directly followed by another option omits the optional value;
+    // only format candidates may be returned, in both spellings.
+    assert_eq!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--color", "--format", ""]
+        ),
+        formats
+    );
+    assert_eq!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--color", "--format=ya"]
+        ),
+        vec!["yaml"]
+    );
+
+    // A committed empty inline value (`--color=`) is a finished invalid value
+    // and invalidates the whole line, even while completing `--format`; color
+    // candidates must not leak in.
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--color=", "--format", "js"]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--color=jx", "--format", ""]
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn suggest_repeated_options_keep_full_sets() {
+    let colors = vec!["auto", "always", "never"];
+    let tags = vec!["red", "blue"];
+
+    // Repeating a repeatable option always offers the full set again; already
+    // completed values never narrow the next occurrence.
+    assert_eq!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--color", "auto", "--color", ""]
+        ),
+        colors
+    );
+    assert_eq!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--color=auto", "--color", ""]
+        ),
+        colors
+    );
+    assert_eq!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--color=auto", "--color="]
+        ),
+        colors
+    );
+    assert_eq!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--color", "auto", "--color=au"]
+        ),
+        vec!["auto"]
+    );
+
+    assert_eq!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--tag", "red", "--tag", ""]
+        ),
+        tags
+    );
+    assert_eq!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--tag=red", "--tag="]
+        ),
+        tags
+    );
+    assert_eq!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--tag", "red", "blue", "--tag", "bl"]
+        ),
+        vec!["blue"]
+    );
+
+    // Repeating a non-repeatable single-value option yields nothing.
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--mode", "fast", "--mode", ""]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--mode=fast", "--mode=sa"]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--format", "json", "--format", ""]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--format=json", "--format=ya"]
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn suggest_invalid_lines_empty() {
+    // A required value cannot be followed by another option or the escape
+    // token; the following token is never consumed as the value.
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--format", "--mode", "sa"]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--format", "--mode"]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--format", "--"]
+        )
+        .is_empty()
+    );
+
+    // An unfinished attached value invalidates the line once a later token is
+    // committed.
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--mode=fa", "--color", ""]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--color=au", ""]
+        )
+        .is_empty()
+    );
+
+    // Unknown options never fall back to other candidates.
+    assert!(
+        complete_argv(&mut parity_value_command(), &["tool", "--bogus", ""]).is_empty()
+    );
+    assert!(
+        complete_argv(&mut parity_value_command(), &["tool", "--bogus=x"]).is_empty()
+    );
+
+    // An illegal committed value prefix invalidates the line, whether attached
+    // or independent.
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--format", "js", "--color", ""]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--format=jx", "--color", ""]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--mode", "quick", ""]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(&mut parity_value_command(), &["tool", "c.txt", ""]).is_empty()
+    );
+}
+
+#[test]
+fn suggest_after_escape_only_files() {
+    // Option-looking tokens after a standalone `--` are positional values of
+    // `files`, never options.
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--", "--color"]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--", "--format="]
+        )
+        .is_empty()
+    );
+    assert!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--", "--unknown"]
+        )
+        .is_empty()
+    );
+
+    // A repeatable positional keeps offering the full set after a value.
+    assert_eq!(
+        complete_argv(
+            &mut parity_value_command(),
+            &["tool", "--", "a.txt", ""]
+        ),
+        vec!["a.txt", "b.txt"]
+    );
+}
+
+#[test]
+fn suggest_parity_state_isolated_across_calls() {
+    let mut cmd = parity_value_command();
+    let colors = vec!["auto", "always", "never"];
+    let tags = vec!["red", "blue"];
+
+    // Successes, failures and partial matches on one command never leak into
+    // the next call, which always starts from freshly rebuilt state.
+    assert!(complete_argv(&mut cmd, &["tool", "--bogus", ""]).is_empty());
+    assert_eq!(complete_argv(&mut cmd, &["tool", "--color", ""]), colors);
+    assert!(complete_argv(&mut cmd, &["tool", "--color=bad"]).is_empty());
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "--color=au"]),
+        vec!["auto"]
+    );
+    assert_eq!(complete_argv(&mut cmd, &["tool", "--color", ""]), colors);
+    assert!(
+        complete_argv(&mut cmd, &["tool", "--mode", "fast", "--mode", ""]).is_empty()
+    );
+    assert_eq!(
+        complete_argv(&mut cmd, &["tool", "--mode", ""]),
+        vec!["fast", "safe"]
+    );
+    assert_eq!(complete_argv(&mut cmd, &["tool", "--tag", ""]), tags);
 }
 
 fn complete(cmd: &mut Command, args: impl AsRef<str>, current_dir: Option<&Path>) -> String {
